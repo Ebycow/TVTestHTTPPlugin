@@ -73,6 +73,11 @@ target_compile_options(TVTestHTTPPlugin PRIVATE
     /MP         # 並列コンパイル
 )
 
+# VC++ ランタイムをスタティックリンク (配布時に Redist 不要)
+set_property(TARGET TVTestHTTPPlugin PROPERTY
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+)
+
 # 出力ファイルを .tvtp に
 set_target_properties(TVTestHTTPPlugin PROPERTIES
     OUTPUT_NAME "TVTestHTTPPlugin"
