@@ -17,6 +17,7 @@
  *   GET  /api/record/status         録画状態
  *   POST /api/record/start          録画開始
  *   POST /api/record/stop           録画停止
+ *   POST /api/ttrec/reserve/default TTRec のデフォルト設定で予約追加
  *
  * GET /api/program/channel クエリパラメータ (いずれか):
  *   ?space=0&channel=5
@@ -134,6 +135,7 @@ struct WriteRequest {
         STOP_RECORD,
         SET_DRIVER,
         GET_EPG_EVENT,      // 任意チャンネルの現在番組取得 (単体または複数)
+        TTREC_RESERVE_DEFAULT,
     };
 
     Type         type;
@@ -144,6 +146,10 @@ struct WriteRequest {
     bool         mute             = false;
     std::wstring driverName;
     bool         hasChannel       = false; // ドライバ切り替え後にチャンネルを指定するか
+    EpgQuery      epgQuery        = {};
+    WORD          eventId         = 0;
+    SYSTEMTIME    startTime       = {};
+    DWORD         duration        = 0;
 
     // GET_EPG_EVENT 用
     std::vector<EpgQuery> epgQueries;  // 取得対象 (1件または複数)
@@ -173,6 +179,31 @@ static std::string WStrToUtf8(const std::wstring &ws)
     std::string s(static_cast<size_t>(n - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, s.data(), n, nullptr, nullptr);
     return s;
+}
+
+static bool ParseIso8601Local(const std::string &value, SYSTEMTIME &st)
+{
+    if (value.size() < 19) return false;
+
+    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
+    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u, 11u, 12u, 14u, 15u, 17u, 18u}) {
+        if (!is_digit(value[i])) return false;
+    }
+    if (value[4] != '-' || value[7] != '-' || (value[10] != 'T' && value[10] != ' ') ||
+        value[13] != ':' || value[16] != ':') {
+        return false;
+    }
+
+    st = {};
+    st.wYear   = static_cast<WORD>(std::stoi(value.substr(0, 4)));
+    st.wMonth  = static_cast<WORD>(std::stoi(value.substr(5, 2)));
+    st.wDay    = static_cast<WORD>(std::stoi(value.substr(8, 2)));
+    st.wHour   = static_cast<WORD>(std::stoi(value.substr(11, 2)));
+    st.wMinute = static_cast<WORD>(std::stoi(value.substr(14, 2)));
+    st.wSecond = static_cast<WORD>(std::stoi(value.substr(17, 2)));
+
+    FILETIME ft = {};
+    return SystemTimeToFileTime(&st, &ft) != FALSE;
 }
 
 // wstring → UTF-8 std::string (WStrToUtf8 の別名)
@@ -323,6 +354,18 @@ static std::string BuildEpgSingleJson(const EpgQuery &q, TVTest::EpgEventInfo *p
     return j.str();
 }
 
+static HWND FindTTRecWindowInCurrentProcess()
+{
+    static constexpr LPCTSTR TTREC_WINDOW_CLASS = TEXT("TVTest TTRec");
+    HWND hwnd = nullptr;
+    while ((hwnd = ::FindWindowEx(nullptr, hwnd, TTREC_WINDOW_CLASS, nullptr)) != nullptr) {
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == ::GetCurrentProcessId()) return hwnd;
+    }
+    return nullptr;
+}
+
 // JSON オブジェクト文字列と channelList から EpgQuery を解決する。
 // 解決できた場合 true を返す。
 static bool ResolveEpgQuery(const std::string &obj,
@@ -334,6 +377,9 @@ static bool ResolveEpgQuery(const std::string &obj,
     int networkId = ParseIntField(obj, "networkId");
     int serviceId = ParseIntField(obj, "serviceId");
     int tsId      = ParseIntField(obj, "transportStreamId");
+    if (networkId == INT_MIN) networkId = ParseIntField(obj, "onid");
+    if (serviceId == INT_MIN) serviceId = ParseIntField(obj, "sid");
+    if (tsId == INT_MIN) tsId = ParseIntField(obj, "tsid");
 
     if (sp != INT_MIN && ch != INT_MIN) {
         // space + channel → channelList から ID を補完
@@ -704,6 +750,49 @@ private:
             req.success = true;
             break;
         }
+
+        case WriteRequest::Type::TTREC_RESERVE_DEFAULT: {
+            static const UINT WM_TTREC_GET_MSGVER = WM_APP + 50;
+            static const UINT WM_TTREC_EVENT_PROGRAMGUIDE_COMMAND = WM_APP + 53;
+            static const UINT TTREC_CURRENT_MSGVER = 1;
+            static const UINT COMMAND_RESERVE_DEFAULT = 2;
+
+            HWND hwndTTRec = FindTTRecWindowInCurrentProcess();
+            if (!hwndTTRec) {
+                req.responseJson =
+                    R"({"error":"TTRec が見つかりません。TVTest に TTRec プラグインを導入して有効化してください"})";
+                break;
+            }
+
+            LRESULT msgVer = ::SendMessage(hwndTTRec, WM_TTREC_GET_MSGVER, 0, 0);
+            if (msgVer != TTREC_CURRENT_MSGVER) {
+                req.responseJson =
+                    R"({"error":"TTRec のメッセージ互換バージョンが一致しません"})";
+                break;
+            }
+
+            TVTest::ProgramGuideCommandParam param = {};
+            param.ID = COMMAND_RESERVE_DEFAULT;
+            param.Action = TVTest::PROGRAMGUIDE_COMMAND_ACTION_MOUSE;
+            param.Program.NetworkID = req.epgQuery.networkId;
+            param.Program.TransportStreamID = req.epgQuery.tsId;
+            param.Program.ServiceID = req.epgQuery.serviceId;
+            param.Program.EventID = req.eventId;
+            param.Program.StartTime = req.startTime;
+            param.Program.Duration = req.duration;
+
+            LRESULT rv = ::SendMessage(
+                hwndTTRec,
+                WM_TTREC_EVENT_PROGRAMGUIDE_COMMAND,
+                COMMAND_RESERVE_DEFAULT,
+                reinterpret_cast<LPARAM>(&param));
+
+            req.success = rv != FALSE;
+            req.responseJson = req.success
+                ? R"({"success":true,"mode":"default","note":"TTRec のデフォルト予約設定に従って追加しました。TTRec 側のデフォルトが「見るだけ」の場合は見るだけ予約になります"})"
+                : R"({"error":"TTRec への予約追加に失敗しました。TTRec が有効で、対象番組の EPG 情報が利用可能か確認してください"})";
+            break;
+        }
         }
 
         SetEvent(req.hDone);
@@ -872,6 +961,58 @@ private:
         // CORS プリフライト
         m_httpServer.Options(".*", [](const httplib::Request &, httplib::Response &res) {
             Cors(res);
+        });
+
+        // ------------------------------------------------------------------
+        // POST /api/ttrec/reserve/default
+        // Body:
+        // {
+        //   "onid":32736,
+        //   "tsid":32736,
+        //   "sid":1024,
+        //   "eid":12345,
+        //   "startTime":"2026-03-26T02:00:00",
+        //   "duration":1800
+        // }
+        // EDCB と共通の onid/tsid/sid/eid 形式を優先して受け付ける。
+        // networkId/serviceId/transportStreamId/eventId も後方互換で受け付ける。
+        // TTRec のデフォルト予約設定に従って追加する。
+        // ------------------------------------------------------------------
+        m_httpServer.Post("/api/ttrec/reserve/default", [this](const httplib::Request &req, httplib::Response &res) {
+            auto state = SnapState();
+            EpgQuery q = {};
+            if (!ResolveEpgQuery(req.body, state.channelList, q)) {
+                Json(res, R"({"error":"onid+sid(+tsid) または networkId+serviceId(+transportStreamId) または space+channel が必要です"})", 400);
+                return;
+            }
+
+            int eventId = ParseIntField(req.body, "eid");
+            if (eventId == INT_MIN) eventId = ParseIntField(req.body, "eventId");
+            int duration = ParseIntField(req.body, "duration");
+            std::string startTimeText = ParseStrField(req.body, "startTime");
+            if (eventId == INT_MIN || duration == INT_MIN || startTimeText.empty()) {
+                Json(res, R"({"error":"eid(eventId)・startTime・duration が必要です"})", 400);
+                return;
+            }
+            if (eventId < 0 || eventId > 0xFFFF || duration < 0) {
+                Json(res, R"({"error":"eventId または duration の値が不正です"})", 400);
+                return;
+            }
+
+            SYSTEMTIME startTime = {};
+            if (!ParseIso8601Local(startTimeText, startTime)) {
+                Json(res, R"({"error":"startTime は YYYY-MM-DDTHH:MM:SS 形式で指定してください"})", 400);
+                return;
+            }
+
+            auto wreq = std::make_shared<WriteRequest>();
+            wreq->type = WriteRequest::Type::TTREC_RESERVE_DEFAULT;
+            wreq->epgQuery = q;
+            wreq->eventId = static_cast<WORD>(eventId);
+            wreq->startTime = startTime;
+            wreq->duration = static_cast<DWORD>(duration);
+            Dispatch(wreq);
+            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
         });
 
         // ------------------------------------------------------------------
