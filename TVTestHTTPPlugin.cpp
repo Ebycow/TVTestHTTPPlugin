@@ -63,13 +63,15 @@
 #include <memory>
 #include <vector>
 
+#include "resource.h"
+
 // =============================================================================
 // 定数
 // =============================================================================
 
-static const int    HTTP_PORT   = 40152;
-static const UINT_PTR TIMER_ID  = 40152u;
-static const UINT   TIMER_MS    = 50u;   // 書き込みリクエスト処理間隔
+static const int    HTTP_PORT_DEFAULT = 40152;
+static const UINT_PTR TIMER_ID        = 40152u;
+static const UINT   TIMER_MS          = 50u;   // 書き込みリクエスト処理間隔
 
 // =============================================================================
 // 状態キャッシュ (メインスレッドで書き、HTTP スレッドで読む)
@@ -440,6 +442,193 @@ static std::vector<EpgQuery> ParseEpgQueryArray(const std::string &json,
 }
 
 // =============================================================================
+// 設定
+// =============================================================================
+
+struct PluginSettings {
+    int          port      = HTTP_PORT_DEFAULT;
+    std::wstring allowList; // カンマ区切り CIDR (例: 192.168.1.0/24,10.0.0.0/8)
+    std::wstring denyList;  // カンマ区切り CIDR
+};
+
+// =============================================================================
+// IP フィルター (CIDR マッチング)
+// =============================================================================
+
+struct CidrBlock {
+    uint32_t addr = 0; // ネットワークアドレス (ホストバイトオーダー)
+    uint32_t mask = 0; // サブネットマスク (ホストバイトオーダー)
+};
+
+// "x.x.x.x/prefix" または "x.x.x.x" を CidrBlock に変換。失敗時 false
+static bool ParseCidr(const std::string &s, CidrBlock &block)
+{
+    // 前後の空白を除去
+    size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return false;
+    size_t last = s.find_last_not_of(" \t\r\n");
+    std::string t = s.substr(first, last - first + 1);
+
+    int prefix = 32;
+    size_t slash = t.find('/');
+    std::string ipStr = (slash != std::string::npos) ? t.substr(0, slash) : t;
+    if (slash != std::string::npos) {
+        try { prefix = std::stoi(t.substr(slash + 1)); }
+        catch (...) { return false; }
+    }
+    if (prefix < 0 || prefix > 32) return false;
+
+    in_addr ia = {};
+    if (inet_pton(AF_INET, ipStr.c_str(), &ia) != 1) return false;
+
+    block.addr = ntohl(ia.s_addr);
+    block.mask = (prefix == 0) ? 0u : (~0u << (32 - prefix));
+    return true;
+}
+
+// ipStr が blocks のいずれかにマッチするか
+static bool IpMatchesList(const std::string &ipStr, const std::vector<CidrBlock> &blocks)
+{
+    if (blocks.empty()) return false;
+    in_addr ia = {};
+    if (inet_pton(AF_INET, ipStr.c_str(), &ia) != 1) return false;
+    uint32_t ip = ntohl(ia.s_addr);
+    for (const auto &b : blocks) {
+        if ((ip & b.mask) == (b.addr & b.mask)) return true;
+    }
+    return false;
+}
+
+// カンマ・改行区切りの CIDR 文字列をパースして CidrBlock のリストを返す
+static std::vector<CidrBlock> ParseCidrList(const std::wstring &wlist)
+{
+    std::vector<CidrBlock> result;
+    std::string list = WStrToUtf8(wlist);
+    std::string cur;
+    for (char c : list) {
+        if (c == ',' || c == '\n' || c == '\r') {
+            if (!cur.empty()) {
+                CidrBlock b;
+                if (ParseCidr(cur, b)) result.push_back(b);
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) {
+        CidrBlock b;
+        if (ParseCidr(cur, b)) result.push_back(b);
+    }
+    return result;
+}
+
+// =============================================================================
+// INI ファイルパス
+// =============================================================================
+
+// DLL と同じフォルダに "TVTestHTTPPlugin.ini" を置く
+// g_hinstDLL は TVTestPlugin.h の TVTEST_PLUGIN_CLASS_IMPLEMENT マクロが定義する
+static std::wstring GetIniFilePath()
+{
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(g_hinstDLL, path, MAX_PATH);
+    // 拡張子を .ini に置換
+    wchar_t *dot = wcsrchr(path, L'.');
+    if (dot) wcscpy_s(dot, MAX_PATH - (dot - path), L".ini");
+    else wcscat_s(path, MAX_PATH, L".ini");
+    return path;
+}
+
+// =============================================================================
+// 設定ダイアログ
+// =============================================================================
+
+struct SettingsDlgData {
+    PluginSettings settings;
+};
+
+static INT_PTR CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+
+    case WM_INITDIALOG: {
+        SetWindowLongPtr(hwnd, DWLP_USER, lParam);
+        auto *data = reinterpret_cast<SettingsDlgData *>(lParam);
+
+        // ポート
+        wchar_t portStr[16] = {};
+        _itow_s(data->settings.port, portStr, 10);
+        SetDlgItemTextW(hwnd, IDC_PORT, portStr);
+
+        // 許可リスト: カンマ → 改行に変換して表示
+        std::wstring allow = data->settings.allowList;
+        for (auto &c : allow) if (c == L',') c = L'\n';
+        SetDlgItemTextW(hwnd, IDC_ALLOW, allow.c_str());
+
+        // 拒否リスト
+        std::wstring deny = data->settings.denyList;
+        for (auto &c : deny) if (c == L',') c = L'\n';
+        SetDlgItemTextW(hwnd, IDC_DENY, deny.c_str());
+
+        return TRUE;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+
+        case IDOK: {
+            auto *data = reinterpret_cast<SettingsDlgData *>(
+                GetWindowLongPtr(hwnd, DWLP_USER));
+
+            // ポート検証
+            wchar_t portStr[16] = {};
+            GetDlgItemTextW(hwnd, IDC_PORT, portStr, _countof(portStr));
+            int port = _wtoi(portStr);
+            if (port < 1024 || port > 65535) {
+                MessageBoxW(hwnd,
+                    L"ポート番号は 1024〜65535 の範囲で入力してください",
+                    L"入力エラー", MB_ICONWARNING | MB_OK);
+                SetFocus(GetDlgItem(hwnd, IDC_PORT));
+                return TRUE;
+            }
+            data->settings.port = port;
+
+            // 許可リスト: \r\n → カンマに変換して保存
+            auto ReadList = [&](int ctrlId) -> std::wstring {
+                wchar_t buf[4096] = {};
+                GetDlgItemTextW(hwnd, ctrlId, buf, _countof(buf));
+                std::wstring result;
+                for (wchar_t c : std::wstring(buf)) {
+                    if (c == L'\r') continue;
+                    if (c == L'\n') {
+                        if (!result.empty() && result.back() != L',') result += L',';
+                    } else {
+                        result += c;
+                    }
+                }
+                // 末尾のカンマを除去
+                while (!result.empty() && result.back() == L',') result.pop_back();
+                return result;
+            };
+
+            data->settings.allowList = ReadList(IDC_ALLOW);
+            data->settings.denyList  = ReadList(IDC_DENY);
+
+            EndDialog(hwnd, IDOK);
+            return TRUE;
+        }
+
+        case IDCANCEL:
+            EndDialog(hwnd, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+// =============================================================================
 // プラグイン本体
 // =============================================================================
 
@@ -466,6 +655,12 @@ class CTVTestHTTPPlugin : public TVTest::CTVTestPlugin
     int m_programRefreshTick = 0;
     static const int PROGRAM_REFRESH_INTERVAL = 40;
 
+    // 設定 (メインスレッドから読み書き; HTTP スレッドからは m_settingsMutex で保護)
+    mutable std::mutex       m_settingsMutex;
+    PluginSettings           m_settings;
+    std::vector<CidrBlock>   m_allowBlocks;
+    std::vector<CidrBlock>   m_denyBlocks;
+
 public:
     CTVTestHTTPPlugin()  { s_pPlugin = this; }
     ~CTVTestHTTPPlugin() { s_pPlugin = nullptr; StopServer(); }
@@ -477,15 +672,18 @@ public:
     bool GetPluginInfo(TVTest::PluginInfo *pInfo) override
     {
         pInfo->Type           = TVTest::PLUGIN_TYPE_NORMAL;
-        pInfo->Flags          = TVTest::PLUGIN_FLAG_ENABLEDEFAULT;
+        pInfo->Flags          = TVTest::PLUGIN_FLAG_ENABLEDEFAULT
+                              | TVTest::PLUGIN_FLAG_HASSETTINGS;
         pInfo->pszPluginName  = L"TVTest HTTP API";
         pInfo->pszCopyright   = L"(c) 2026";
-        pInfo->pszDescription = L"HTTP REST API でTVTestを外部から制御します (port 40152)";
+        pInfo->pszDescription = L"HTTP REST API で TVTest を外部から制御します";
         return true;
     }
 
     bool Initialize() override
     {
+        LoadSettings();
+        UpdateCidrBlocks();
         m_pApp->SetEventCallback(EventCallback, this);
         SetTimer(m_pPluginParam->hwndApp, TIMER_ID, TIMER_MS, TimerProc);
         // 起動時に既に有効状態の場合、EVENT_PLUGINENABLE が来ないのでここで起動する
@@ -520,6 +718,9 @@ private:
                 self->StopServer();
             }
             return TRUE;
+
+        case TVTest::EVENT_PLUGINSETTINGS:
+            return self->OnPluginSettings(reinterpret_cast<HWND>(p1)) ? TRUE : FALSE;
 
         case TVTest::EVENT_CHANNELCHANGE:
             // チャンネルリストが未取得の場合（起動時に空だった）はここで取得する
@@ -929,8 +1130,9 @@ private:
         if (m_serverStarted) return;
         SetupRoutes();
         m_serverStarted = true;
-        m_httpThread = std::thread([this] {
-            m_httpServer.listen("0.0.0.0", HTTP_PORT);
+        int port = m_settings.port;  // ← 設定されたポートを使用
+        m_httpThread = std::thread([this, port] {
+            m_httpServer.listen("0.0.0.0", port);
         });
     }
 
@@ -958,6 +1160,18 @@ private:
 
     void SetupRoutes()
     {
+        // IP フィルター: 全リクエストに先立って許可/拒否を確認
+        m_httpServer.set_pre_routing_handler(
+            [this](const httplib::Request &req, httplib::Response &res)
+                -> httplib::Server::HandlerResponse
+            {
+                if (!IsIpAllowed(req.remote_addr)) {
+                    Json(res, R"({"error":"Forbidden"})", 403);
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+
         // CORS プリフライト
         m_httpServer.Options(".*", [](const httplib::Request &, httplib::Response &res) {
             Cors(res);
@@ -1327,6 +1541,97 @@ private:
             Dispatch(wreq);
             Json(res, wreq->responseJson, wreq->success ? 200 : 500);
         });
+    }
+
+    // -------------------------------------------------------------------------
+    // 設定の読み書き (メインスレッドから呼ぶこと)
+    // -------------------------------------------------------------------------
+
+    void LoadSettings()
+    {
+        std::wstring ini = GetIniFilePath();
+        const wchar_t *sec = L"Settings";
+
+        int port = static_cast<int>(
+            GetPrivateProfileIntW(sec, L"Port", HTTP_PORT_DEFAULT, ini.c_str()));
+        if (port < 1024 || port > 65535) port = HTTP_PORT_DEFAULT;
+        m_settings.port = port;
+
+        wchar_t buf[4096] = {};
+        GetPrivateProfileStringW(sec, L"AllowList", L"", buf, _countof(buf), ini.c_str());
+        m_settings.allowList = buf;
+
+        GetPrivateProfileStringW(sec, L"DenyList", L"", buf, _countof(buf), ini.c_str());
+        m_settings.denyList = buf;
+    }
+
+    void SaveSettings() const
+    {
+        std::wstring ini = GetIniFilePath();
+        const wchar_t *sec = L"Settings";
+
+        wchar_t portStr[16] = {};
+        _itow_s(m_settings.port, portStr, 10);
+        WritePrivateProfileStringW(sec, L"Port",      portStr,                  ini.c_str());
+        WritePrivateProfileStringW(sec, L"AllowList", m_settings.allowList.c_str(), ini.c_str());
+        WritePrivateProfileStringW(sec, L"DenyList",  m_settings.denyList.c_str(),  ini.c_str());
+    }
+
+    // CIDR ブロックリストを設定から再構築 (メインスレッドから呼ぶこと)
+    void UpdateCidrBlocks()
+    {
+        auto newAllow = ParseCidrList(m_settings.allowList);
+        auto newDeny  = ParseCidrList(m_settings.denyList);
+        std::lock_guard<std::mutex> lk(m_settingsMutex);
+        m_allowBlocks = std::move(newAllow);
+        m_denyBlocks  = std::move(newDeny);
+    }
+
+    // 接続元 IP が許可されているか (HTTP スレッドから呼んでよい)
+    bool IsIpAllowed(const std::string &ip) const
+    {
+        std::vector<CidrBlock> allows, denies;
+        {
+            std::lock_guard<std::mutex> lk(m_settingsMutex);
+            allows = m_allowBlocks;
+            denies = m_denyBlocks;
+        }
+        // 拒否リストに含まれていれば拒否
+        if (!denies.empty() && IpMatchesList(ip, denies)) return false;
+        // 許可リストが空でなければリストに含まれる場合のみ許可
+        if (!allows.empty() && !IpMatchesList(ip, allows)) return false;
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // 設定ダイアログ (メインスレッドから呼ぶこと)
+    // -------------------------------------------------------------------------
+
+    bool OnPluginSettings(HWND hwndOwner)
+    {
+        SettingsDlgData data;
+        data.settings = m_settings;
+
+        INT_PTR result = DialogBoxParamW(
+            g_hinstDLL,
+            MAKEINTRESOURCEW(IDD_SETTINGS),
+            hwndOwner,
+            SettingsDlgProc,
+            reinterpret_cast<LPARAM>(&data));
+
+        if (result != IDOK) return false;
+
+        bool portChanged = (data.settings.port != m_settings.port);
+        m_settings = data.settings;
+        SaveSettings();
+        UpdateCidrBlocks();
+
+        if (portChanged && m_serverStarted) {
+            // ポート変更: サーバーを再起動
+            StopServer();
+            StartServer();
+        }
+        return true;
     }
 };
 

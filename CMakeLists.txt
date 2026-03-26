@@ -55,7 +55,7 @@ endif()
 # ターゲット
 # =============================================================================
 
-add_library(TVTestHTTPPlugin SHARED TVTestHTTPPlugin.cpp)
+add_library(TVTestHTTPPlugin SHARED TVTestHTTPPlugin.cpp TVTestHTTPPlugin.rc)
 
 target_include_directories(TVTestHTTPPlugin PRIVATE "${SDK_DIR}")
 

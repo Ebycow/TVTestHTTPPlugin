@@ -1,0 +1,24 @@
+#pragma code_page(65001)
+#include <winres.h>
+#include "resource.h"
+
+IDD_SETTINGS DIALOGEX 0, 0, 306, 185
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "TVTest HTTP API 設定"
+FONT 9, "MS UI Gothic", 400, 0, 0x80
+BEGIN
+    LTEXT           "ポート番号 (1024-65535):",           IDC_STATIC, 10,  10, 200,  10
+    EDITTEXT        IDC_PORT,                                         10,  22,  60,  14, ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "接続許可 IP リスト  (空欄 = すべて許可)",        IDC_STATIC, 10,  46, 286,  10
+    LTEXT           "例: 192.168.1.0/24, 10.0.0.0/8  (カンマまたは改行で複数指定)",
+                                                                      IDC_STATIC, 10,  57, 286,  10
+    EDITTEXT        IDC_ALLOW,                                        10,  70, 286,  40, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+
+    LTEXT           "接続拒否 IP リスト  (空欄 = 拒否なし)",          IDC_STATIC, 10, 118, 286,  10
+    LTEXT           "例: 192.168.1.100/32",                           IDC_STATIC, 10, 129, 286,  10
+    EDITTEXT        IDC_DENY,                                         10, 142, 286,  28, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+
+    DEFPUSHBUTTON   "OK",           IDOK,     196, 167,  50, 14
+    PUSHBUTTON      "キャンセル",   IDCANCEL, 250, 167,  50, 14
+END
