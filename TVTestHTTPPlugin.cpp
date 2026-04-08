@@ -93,6 +93,8 @@ struct EpgQuery {
     WORD networkId  = 0;
     WORD tsId       = 0;
     WORD serviceId  = 0;
+    WORD eventId    = 0;     // hasEventId == true のときのみ有効
+    bool hasEventId = false; // true: EPG_EVENT_QUERY_EVENTID / false: EPG_EVENT_QUERY_TIME
 };
 
 struct TVTestState {
@@ -909,8 +911,9 @@ private:
             break;
 
         case WriteRequest::Type::GET_EPG_EVENT: {
-            FILETIME ft;
-            GetSystemTimeAsFileTime(&ft);
+            FILETIME ft = {};
+            if ([&]{ for (const auto &q : req.epgQueries) if (!q.hasEventId) return true; return false; }())
+                GetSystemTimeAsFileTime(&ft);
 
             const auto &queries = req.epgQueries;
             if (queries.size() == 1) {
@@ -920,9 +923,14 @@ private:
                 qi.NetworkID         = q.networkId;
                 qi.TransportStreamID = q.tsId;
                 qi.ServiceID         = q.serviceId;
-                qi.Type              = TVTest::EPG_EVENT_QUERY_TIME;
                 qi.Flags             = 0;
-                qi.Time              = ft;
+                if (q.hasEventId) {
+                    qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
+                    qi.EventID = q.eventId;
+                } else {
+                    qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
+                    qi.Time  = ft;
+                }
                 TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
                 req.epgResultJson = BuildEpgSingleJson(q, pEvent);
                 if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
@@ -938,9 +946,14 @@ private:
                     qi.NetworkID         = q.networkId;
                     qi.TransportStreamID = q.tsId;
                     qi.ServiceID         = q.serviceId;
-                    qi.Type              = TVTest::EPG_EVENT_QUERY_TIME;
                     qi.Flags             = 0;
-                    qi.Time              = ft;
+                    if (q.hasEventId) {
+                        qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
+                        qi.EventID = q.eventId;
+                    } else {
+                        qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
+                        qi.Time  = ft;
+                    }
                     TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
                     j << BuildEpgSingleJson(q, pEvent);
                     if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
@@ -1386,6 +1399,9 @@ private:
         //   ?space=0&channel=5
         //   ?networkId=32736&serviceId=1024
         //   ?networkId=32736&serviceId=1024&transportStreamId=32736
+        // オプション:
+        //   &eventId=12345  指定すると EPG_EVENT_QUERY_EVENTID で当該イベントを取得
+        //                   省略時は現在放送中の番組を取得 (EPG_EVENT_QUERY_TIME)
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/program/channel", [this](const httplib::Request &req, httplib::Response &res) {
             EpgQuery q = {};
@@ -1426,6 +1442,12 @@ private:
             } else {
                 Json(res, R"({"error":"space+channel または networkId+serviceId が必要です"})", 400);
                 return;
+            }
+
+            // eventId が指定されていれば EPG_EVENT_QUERY_EVENTID を使う
+            if (req.has_param("eventId")) {
+                q.eventId    = static_cast<WORD>(std::stoi(req.get_param_value("eventId")));
+                q.hasEventId = true;
             }
 
             auto wreq = std::make_shared<WriteRequest>();
