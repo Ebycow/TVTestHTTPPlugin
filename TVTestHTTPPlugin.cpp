@@ -972,6 +972,24 @@ private:
             static const UINT TTREC_CURRENT_MSGVER = 1;
             static const UINT COMMAND_RESERVE_DEFAULT = 2;
 
+            // TVTest の EPG に対象イベントが存在するか確認する
+            {
+                TVTest::EpgEventQueryInfo qi = {};
+                qi.NetworkID         = req.epgQuery.networkId;
+                qi.TransportStreamID = req.epgQuery.tsId;
+                qi.ServiceID         = req.epgQuery.serviceId;
+                qi.Type              = TVTest::EPG_EVENT_QUERY_EVENTID;
+                qi.EventID           = req.eventId;
+                qi.Flags             = 0;
+                TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
+                if (!pEvent) {
+                    req.responseJson =
+                        R"({"error":"指定された番組の EPG 情報が見つかりません。TVTest の番組表が取得されているか確認してください"})";
+                    break;
+                }
+                m_pApp->FreeEpgEventInfo(pEvent);
+            }
+
             HWND hwndTTRec = FindTTRecWindowInCurrentProcess();
             if (!hwndTTRec) {
                 req.responseJson =
