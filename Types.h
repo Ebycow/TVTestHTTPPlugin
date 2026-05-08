@@ -59,6 +59,23 @@ struct TVTestState {
 };
 
 // =============================================================================
+// Windows イベントハンドルの RAII ラッパー
+// =============================================================================
+
+struct WinEvent {
+    HANDLE h = nullptr;
+
+    WinEvent() : h(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+    ~WinEvent() { if (h) CloseHandle(h); }
+
+    WinEvent(const WinEvent &)            = delete;
+    WinEvent &operator=(const WinEvent &) = delete;
+
+    operator HANDLE() const { return h; }
+    bool valid() const { return h != nullptr; }
+};
+
+// =============================================================================
 // 書き込みリクエスト (HTTP スレッド → メインスレッド)
 // =============================================================================
 
@@ -95,12 +112,9 @@ struct WriteRequest {
     // 結果 (メインスレッドが書き, HTTP スレッドが読む)
     bool         success          = false;
     std::string  responseJson;
-    HANDLE       hDone;
+    WinEvent     hDone;
 
-    WriteRequest()  : hDone(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
-    ~WriteRequest() { if (hDone) CloseHandle(hDone); }
-
-    // コピー禁止
+    WriteRequest()                               = default;
     WriteRequest(const WriteRequest &)            = delete;
     WriteRequest &operator=(const WriteRequest &) = delete;
 };
