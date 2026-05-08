@@ -73,6 +73,7 @@
 #include "EpgHelper.h"
 #include "IpFilter.h"
 #include "Settings.h"
+#include "SettingsStore.h"
 #include "TtrecHelper.h"
 
 // =============================================================================
@@ -1011,32 +1012,12 @@ private:
 
     void LoadSettings()
     {
-        std::wstring ini = GetIniFilePath();
-        const wchar_t *sec = L"Settings";
-
-        int port = static_cast<int>(
-            GetPrivateProfileIntW(sec, L"Port", HTTP_PORT_DEFAULT, ini.c_str()));
-        if (port < 1024 || port > 65535) port = HTTP_PORT_DEFAULT;
-        m_settings.port = port;
-
-        wchar_t buf[4096] = {};
-        GetPrivateProfileStringW(sec, L"AllowList", L"", buf, _countof(buf), ini.c_str());
-        m_settings.allowList = buf;
-
-        GetPrivateProfileStringW(sec, L"DenyList", L"", buf, _countof(buf), ini.c_str());
-        m_settings.denyList = buf;
+        m_settings = TVTestHTTP::LoadPluginSettings();
     }
 
     void SaveSettings() const
     {
-        std::wstring ini = GetIniFilePath();
-        const wchar_t *sec = L"Settings";
-
-        wchar_t portStr[16] = {};
-        _itow_s(m_settings.port, portStr, 10);
-        WritePrivateProfileStringW(sec, L"Port",      portStr,                  ini.c_str());
-        WritePrivateProfileStringW(sec, L"AllowList", m_settings.allowList.c_str(), ini.c_str());
-        WritePrivateProfileStringW(sec, L"DenyList",  m_settings.denyList.c_str(),  ini.c_str());
+        TVTestHTTP::SavePluginSettings(m_settings);
     }
 
     // CIDR ブロックリストを設定から再構築 (メインスレッドから呼ぶこと)
