@@ -9,22 +9,6 @@
 extern HINSTANCE g_hinstDLL;
 
 // =============================================================================
-// INI ファイルパス
-// =============================================================================
-
-// DLL と同じフォルダに "TVTestHTTPPlugin.ini" を置く
-static std::wstring GetIniFilePath()
-{
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(g_hinstDLL, path, MAX_PATH);
-    // 拡張子を .ini に置換
-    wchar_t *dot = wcsrchr(path, L'.');
-    if (dot) wcscpy_s(dot, MAX_PATH - (dot - path), L".ini");
-    else wcscat_s(path, MAX_PATH, L".ini");
-    return path;
-}
-
-// =============================================================================
 // 設定ダイアログ
 // =============================================================================
 
