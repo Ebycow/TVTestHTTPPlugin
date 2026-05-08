@@ -2,6 +2,7 @@
 
 #include "JsonHelpers.h"
 
+#include <windows.h>
 #include <sstream>
 #include <string>
 
@@ -117,4 +118,45 @@ static std::string BuildTtrecReservesJson(const std::wstring &content)
     }
     j << "]";
     return j.str();
+}
+
+static bool LoadTtrecReservesJson(HWND hwndTTRec, std::string &json)
+{
+    HINSTANCE hinstTTRec = reinterpret_cast<HINSTANCE>(
+        ::GetWindowLongPtr(hwndTTRec, GWLP_HINSTANCE));
+    wchar_t dllPath[MAX_PATH] = {};
+    if (!::GetModuleFileNameW(hinstTTRec, dllPath, MAX_PATH)) {
+        return false;
+    }
+
+    wchar_t reservePath[MAX_PATH + 16] = {};
+    ::wcscpy_s(reservePath, dllPath);
+    wchar_t *dot = ::wcsrchr(reservePath, L'.');
+    if (dot) *dot = L'\0';
+    ::wcscat_s(reservePath, L"_Reserves.txt");
+
+    HANDLE hFile = ::CreateFileW(reservePath, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        json = R"([])";
+        return true;
+    }
+
+    DWORD fileBytes = ::GetFileSize(hFile, nullptr);
+    std::wstring content;
+    if (fileBytes >= sizeof(wchar_t) * 2) {
+        wchar_t bom = 0;
+        DWORD rd = 0;
+        if (::ReadFile(hFile, &bom, sizeof(wchar_t), &rd, nullptr) && bom == L'\xFEFF') {
+            DWORD wchars = (fileBytes / sizeof(wchar_t)) - 1;
+            content.resize(wchars);
+            ::ReadFile(hFile, &content[0], wchars * sizeof(wchar_t), &rd, nullptr);
+            content.resize(rd / sizeof(wchar_t));
+        }
+    }
+    ::CloseHandle(hFile);
+
+    json = BuildTtrecReservesJson(content);
+    return true;
 }
