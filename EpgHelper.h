@@ -6,8 +6,6 @@
 #include "Types.h"
 #include "JsonHelpers.h"
 
-#include <sstream>
-
 // =============================================================================
 // EPG ヘルパー
 // =============================================================================
@@ -40,7 +38,7 @@ static SYSTEMTIME AddSeconds(const SYSTEMTIME &st, DWORD seconds)
     FILETIME ft;
     SystemTimeToFileTime(&st, &ft);
     ULONGLONG ull = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    ull += (ULONGLONG)seconds * 10000000ULL; // 秒 → 100ns 単位
+    ull += (ULONGLONG)seconds * 10000000ULL;
     ft.dwHighDateTime = (DWORD)(ull >> 32);
     ft.dwLowDateTime  = (DWORD)(ull & 0xFFFFFFFF);
     SYSTEMTIME result = {};
@@ -48,32 +46,32 @@ static SYSTEMTIME AddSeconds(const SYSTEMTIME &st, DWORD seconds)
     return result;
 }
 
-// EpgQuery + EpgEventInfo* から JSON オブジェクト文字列を組み立てる
-// pEvent が nullptr の場合は status:"unavailable"
-static std::string BuildEpgSingleJson(const EpgQuery &q, TVTest::EpgEventInfo *pEvent)
+// EpgQuery + EpgEventInfo* から nlohmann::json オブジェクトを組み立てる
+static nlohmann::json BuildEpgEventJson(const EpgQuery &q, TVTest::EpgEventInfo *pEvent)
 {
-    std::ostringstream j;
-    j << "{"
-      << "\"networkId\":"         << q.networkId << ","
-      << "\"transportStreamId\":" << q.tsId      << ","
-      << "\"serviceId\":"         << q.serviceId << ","
-      << "\"fetchedAt\":\""       << NowLocalIso8601() << "\",";
+    using json = nlohmann::json;
+    json j;
+    j["networkId"]         = q.networkId;
+    j["transportStreamId"] = q.tsId;
+    j["serviceId"]         = q.serviceId;
+    j["fetchedAt"]         = NowLocalIso8601();
 
     if (pEvent) {
         SYSTEMTIME endSt = AddSeconds(pEvent->StartTime, pEvent->Duration);
-        j << "\"status\":\"available\","
-          << "\"program\":{"
-          << "\"eventId\":"     << pEvent->EventID << ","
-          << "\"name\":\""      << (pEvent->pszEventName ? JsonStr(std::wstring(pEvent->pszEventName)) : "") << "\","
-          << "\"text\":\""      << (pEvent->pszEventText ? JsonStr(std::wstring(pEvent->pszEventText)) : "") << "\","
-          << "\"startTime\":\"" << SystemTimeToIso8601(pEvent->StartTime) << "\","
-          << "\"endTime\":\""   << SystemTimeToIso8601(endSt) << "\","
-          << "\"duration\":"    << pEvent->Duration
-          << "}}";
+        j["status"]  = "available";
+        j["program"] = {
+            {"eventId",   pEvent->EventID},
+            {"name",      pEvent->pszEventName ? WStrToUtf8(pEvent->pszEventName) : ""},
+            {"text",      pEvent->pszEventText ? WStrToUtf8(pEvent->pszEventText) : ""},
+            {"startTime", SystemTimeToIso8601(pEvent->StartTime)},
+            {"endTime",   SystemTimeToIso8601(endSt)},
+            {"duration",  pEvent->Duration}
+        };
     } else {
-        j << "\"status\":\"unavailable\",\"program\":null}";
+        j["status"]  = "unavailable";
+        j["program"] = nullptr;
     }
-    return j.str();
+    return j;
 }
 
 static HWND FindTTRecWindowInCurrentProcess()
@@ -88,23 +86,19 @@ static HWND FindTTRecWindowInCurrentProcess()
     return nullptr;
 }
 
-// JSON オブジェクト文字列と channelList から EpgQuery を解決する。
-// 解決できた場合 true を返す。
-static bool ResolveEpgQuery(const std::string &obj,
+// nlohmann::json オブジェクトから EpgQuery を解決する
+static bool ResolveEpgQuery(const nlohmann::json &j,
                              const std::vector<ChannelEntry> &channelList,
                              EpgQuery &q)
 {
-    int sp        = ParseIntField(obj, "space");
-    int ch        = ParseIntField(obj, "channel");
-    int networkId = ParseIntField(obj, "networkId");
-    int serviceId = ParseIntField(obj, "serviceId");
-    int tsId      = ParseIntField(obj, "transportStreamId");
-    if (networkId == INT_MIN) networkId = ParseIntField(obj, "onid");
-    if (serviceId == INT_MIN) serviceId = ParseIntField(obj, "sid");
-    if (tsId == INT_MIN) tsId = ParseIntField(obj, "tsid");
+    auto intVal = [&](const char *key) -> int {
+        auto it = j.find(key);
+        if (it == j.end() || !it->is_number_integer()) return -1;
+        return it->get<int>();
+    };
 
-    if (sp != INT_MIN && ch != INT_MIN) {
-        // space + channel → channelList から ID を補完
+    int sp = intVal("space"), ch = intVal("channel");
+    if (sp >= 0 && ch >= 0) {
         for (const auto &e : channelList) {
             if (e.space == sp && e.channel == ch) {
                 q.networkId = static_cast<WORD>(e.networkID);
@@ -113,16 +107,22 @@ static bool ResolveEpgQuery(const std::string &obj,
                 return true;
             }
         }
-        return false; // 見つからない
+        return false;
     }
 
-    if (networkId != INT_MIN && serviceId != INT_MIN) {
+    int networkId = intVal("networkId");
+    if (networkId < 0) networkId = intVal("onid");
+    int serviceId = intVal("serviceId");
+    if (serviceId < 0) serviceId = intVal("sid");
+    int tsId = intVal("transportStreamId");
+    if (tsId < 0) tsId = intVal("tsid");
+
+    if (networkId >= 0 && serviceId >= 0) {
         q.networkId = static_cast<WORD>(networkId);
         q.serviceId = static_cast<WORD>(serviceId);
-        if (tsId != INT_MIN) {
+        if (tsId >= 0) {
             q.tsId = static_cast<WORD>(tsId);
         } else {
-            // channelList から tsId を補完 (見つからなくても続行)
             for (const auto &e : channelList) {
                 if (e.networkID == networkId && e.serviceID == serviceId) {
                     q.tsId = static_cast<WORD>(e.tsID);
@@ -137,26 +137,17 @@ static bool ResolveEpgQuery(const std::string &obj,
 }
 
 // JSON 配列文字列を解析して EpgQuery のベクタを返す
-static std::vector<EpgQuery> ParseEpgQueryArray(const std::string &json,
+static std::vector<EpgQuery> ParseEpgQueryArray(const std::string &body,
                                                  const std::vector<ChannelEntry> &channelList)
 {
     std::vector<EpgQuery> result;
-    int depth = 0;
-    size_t start = std::string::npos;
-    for (size_t i = 0; i < json.size(); ++i) {
-        if (json[i] == '{') {
-            if (depth == 0) start = i;
-            ++depth;
-        } else if (json[i] == '}') {
-            --depth;
-            if (depth == 0 && start != std::string::npos) {
-                std::string obj = json.substr(start, i - start + 1);
-                EpgQuery q;
-                if (ResolveEpgQuery(obj, channelList, q))
-                    result.push_back(q);
-                start = std::string::npos;
-            }
-        }
+    auto arr = nlohmann::json::parse(body, nullptr, false);
+    if (!arr.is_array()) return result;
+    for (const auto &item : arr) {
+        if (!item.is_object()) continue;
+        EpgQuery q;
+        if (ResolveEpgQuery(item, channelList, q))
+            result.push_back(q);
     }
     return result;
 }

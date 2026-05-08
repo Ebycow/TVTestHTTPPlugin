@@ -4,114 +4,93 @@
 #include "JsonHelpers.h"
 #include "Types.h"
 
-#include <sstream>
-#include <string>
-#include <vector>
-
 namespace TVTestHTTP {
 
 static std::string BuildStatusJson(const TVTestState &s, int recordingStatus)
 {
-    std::ostringstream j;
-    j << "{";
+    using json = nlohmann::json;
+    json j;
 
     if (s.hasChannel) {
-        j << "\"channel\":{"
-          << "\"space\":"             << s.space             << ","
-          << "\"channel\":"           << s.channel           << ","
-          << "\"remoteControlKey\":"  << s.remoteControlKey  << ","
-          << "\"serviceId\":"         << s.serviceID         << ","
-          << "\"networkId\":"         << s.networkID         << ","
-          << "\"transportStreamId\":" << s.tsID              << ","
-          << "\"name\":\""            << JsonStr(s.channelName) << "\","
-          << "\"networkName\":\""     << JsonStr(s.networkName) << "\""
-          << "},";
+        j["channel"] = {
+            {"space",             s.space},
+            {"channel",           s.channel},
+            {"remoteControlKey",  s.remoteControlKey},
+            {"serviceId",         s.serviceID},
+            {"networkId",         s.networkID},
+            {"transportStreamId", s.tsID},
+            {"name",              WStrToUtf8(s.channelName)},
+            {"networkName",       WStrToUtf8(s.networkName)}
+        };
     } else {
-        j << "\"channel\":null,";
+        j["channel"] = nullptr;
     }
 
-    j << "\"volume\":"       << s.volume                         << ","
-      << "\"mute\":"         << (s.mute ? "true" : "false")      << ","
-      << "\"recordStatus\":" << s.recordStatus                   << ","
-      << "\"recording\":"    << (s.recordStatus == recordingStatus ? "true" : "false");
+    j["volume"]       = s.volume;
+    j["mute"]         = s.mute;
+    j["recordStatus"] = s.recordStatus;
+    j["recording"]    = (s.recordStatus == recordingStatus);
 
     if (s.hasProgramInfo) {
-        j << ",\"program\":{"
-          << "\"name\":\"" << JsonStr(s.programName) << "\","
-          << "\"text\":\"" << JsonStr(s.programText) << "\""
-          << "}";
+        j["program"] = {
+            {"name", WStrToUtf8(s.programName)},
+            {"text", WStrToUtf8(s.programText)}
+        };
     } else {
-        j << ",\"program\":null";
+        j["program"] = nullptr;
     }
 
-    j << "}";
-    return j.str();
+    return j.dump();
 }
 
 static std::string BuildChannelsJson(const std::vector<ChannelEntry> &channels)
 {
-    std::ostringstream j;
-    j << "[";
-    bool first = true;
+    using json = nlohmann::json;
+    json arr = json::array();
     for (const auto &e : channels) {
-        if (!first) j << ",";
-        first = false;
-        j << "{"
-          << "\"space\":"            << e.space            << ","
-          << "\"channel\":"          << e.channel          << ","
-          << "\"remoteControlKey\":" << e.remoteControlKey << ","
-          << "\"serviceId\":"        << e.serviceID        << ","
-          << "\"networkId\":"        << e.networkID        << ","
-          << "\"name\":\""           << JsonStr(e.name)        << "\","
-          << "\"networkName\":\""    << JsonStr(e.networkName) << "\""
-          << "}";
+        arr.push_back({
+            {"space",            e.space},
+            {"channel",          e.channel},
+            {"remoteControlKey", e.remoteControlKey},
+            {"serviceId",        e.serviceID},
+            {"networkId",        e.networkID},
+            {"name",             WStrToUtf8(e.name)},
+            {"networkName",      WStrToUtf8(e.networkName)}
+        });
     }
-    j << "]";
-    return j.str();
+    return arr.dump();
 }
 
 static std::string BuildVolumeJson(const TVTestState &s)
 {
-    std::ostringstream j;
-    j << "{\"volume\":" << s.volume
-      << ",\"mute\":"   << (s.mute ? "true" : "false") << "}";
-    return j.str();
+    return nlohmann::json{{"volume", s.volume}, {"mute", s.mute}}.dump();
 }
 
 static std::string BuildProgramJson(const TVTestState &s)
 {
-    if (!s.hasProgramInfo) return R"({"program":null})";
-
-    std::ostringstream j;
-    j << "{\"program\":{"
-      << "\"name\":\"" << JsonStr(s.programName) << "\","
-      << "\"text\":\"" << JsonStr(s.programText) << "\""
-      << "}}";
-    return j.str();
+    if (!s.hasProgramInfo)
+        return nlohmann::json{{"program", nullptr}}.dump();
+    return nlohmann::json{{"program", {
+        {"name", WStrToUtf8(s.programName)},
+        {"text", WStrToUtf8(s.programText)}
+    }}}.dump();
 }
 
 static std::string BuildRecordStatusJson(const TVTestState &s, int recordingStatus)
 {
-    std::ostringstream j;
-    j << "{\"status\":"    << s.recordStatus
-      << ",\"recording\":" << (s.recordStatus == recordingStatus ? "true" : "false")
-      << "}";
-    return j.str();
+    return nlohmann::json{
+        {"status",    s.recordStatus},
+        {"recording", s.recordStatus == recordingStatus}
+    }.dump();
 }
 
 static std::string BuildDriverJson(const std::wstring &currentDriver,
                                    const std::vector<std::wstring> &drivers)
 {
-    std::ostringstream j;
-    j << "{\"current\":\"" << JsonStr(currentDriver) << "\",\"drivers\":[";
-    bool first = true;
-    for (const auto &driver : drivers) {
-        if (!first) j << ",";
-        first = false;
-        j << "\"" << JsonStr(driver) << "\"";
-    }
-    j << "]}";
-    return j.str();
+    using json = nlohmann::json;
+    json arr = json::array();
+    for (const auto &d : drivers) arr.push_back(WStrToUtf8(d));
+    return json{{"current", WStrToUtf8(currentDriver)}, {"drivers", arr}}.dump();
 }
 
 } // namespace TVTestHTTP

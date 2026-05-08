@@ -57,7 +57,6 @@
 #include "httplib.h"
 
 #include <string>
-#include <sstream>
 #include <thread>
 #include <mutex>
 #include <queue>
@@ -361,10 +360,7 @@ private:
             if ([&]{ for (const auto &q : req.epgQueries) if (!q.hasEventId) return true; return false; }())
                 GetSystemTimeAsFileTime(&ft);
 
-            const auto &queries = req.epgQueries;
-            if (queries.size() == 1) {
-                // 単体 → JSON オブジェクト
-                const auto &q = queries[0];
+            auto queryOne = [&](const EpgQuery &q) -> nlohmann::json {
                 TVTest::EpgEventQueryInfo qi = {};
                 qi.NetworkID         = q.networkId;
                 qi.TransportStreamID = q.tsId;
@@ -378,34 +374,18 @@ private:
                     qi.Time  = ft;
                 }
                 TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
-                req.epgResultJson = BuildEpgSingleJson(q, pEvent);
+                auto j = BuildEpgEventJson(q, pEvent);
                 if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
+                return j;
+            };
+
+            const auto &queries = req.epgQueries;
+            if (queries.size() == 1) {
+                req.epgResultJson = queryOne(queries[0]).dump();
             } else {
-                // 複数 → JSON 配列
-                std::ostringstream j;
-                j << "[";
-                bool first = true;
-                for (const auto &q : queries) {
-                    if (!first) j << ",";
-                    first = false;
-                    TVTest::EpgEventQueryInfo qi = {};
-                    qi.NetworkID         = q.networkId;
-                    qi.TransportStreamID = q.tsId;
-                    qi.ServiceID         = q.serviceId;
-                    qi.Flags             = 0;
-                    if (q.hasEventId) {
-                        qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
-                        qi.EventID = q.eventId;
-                    } else {
-                        qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
-                        qi.Time  = ft;
-                    }
-                    TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
-                    j << BuildEpgSingleJson(q, pEvent);
-                    if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
-                }
-                j << "]";
-                req.epgResultJson = j.str();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto &q : queries) arr.push_back(queryOne(q));
+                req.epgResultJson = arr.dump();
             }
             req.success = true;
             break;
@@ -670,22 +650,36 @@ private:
         // TTRec のデフォルト予約設定に従って追加する。
         // ------------------------------------------------------------------
         m_httpServer.Post("/api/ttrec/reserve/default", [this](const httplib::Request &req, httplib::Response &res) {
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                Json(res, R"({"error":"JSON の解析に失敗しました"})", 400);
+                return;
+            }
+
             auto state = SnapState();
             EpgQuery q = {};
-            if (!ResolveEpgQuery(req.body, state.channelList, q)) {
+            if (!ResolveEpgQuery(body, state.channelList, q)) {
                 Json(res, R"({"error":"onid+sid(+tsid) または networkId+serviceId(+transportStreamId) または space+channel が必要です"})", 400);
                 return;
             }
 
-            int eventId = ParseIntField(req.body, "eid");
-            if (eventId == INT_MIN) eventId = ParseIntField(req.body, "eventId");
-            int duration = ParseIntField(req.body, "duration");
-            std::string startTimeText = ParseStrField(req.body, "startTime");
-            if (eventId == INT_MIN || duration == INT_MIN || startTimeText.empty()) {
+            auto getInt = [&](const char *k1, const char *k2 = nullptr) -> int {
+                auto it = body.find(k1);
+                if (it != body.end() && it->is_number_integer()) return it->get<int>();
+                if (k2) { it = body.find(k2); if (it != body.end() && it->is_number_integer()) return it->get<int>(); }
+                return -1;
+            };
+            int eventId  = getInt("eid", "eventId");
+            int duration = getInt("duration");
+            std::string startTimeText;
+            if (auto it = body.find("startTime"); it != body.end() && it->is_string())
+                startTimeText = it->get<std::string>();
+
+            if (eventId < 0 || duration < 0 || startTimeText.empty()) {
                 Json(res, R"({"error":"eid(eventId)・startTime・duration が必要です"})", 400);
                 return;
             }
-            if (eventId < 0 || eventId > 0xFFFF || duration < 0) {
+            if (eventId > 0xFFFF) {
                 Json(res, R"({"error":"eventId または duration の値が不正です"})", 400);
                 return;
             }
@@ -733,23 +727,26 @@ private:
         //    or {"space":0,"channel":5}
         // ------------------------------------------------------------------
         m_httpServer.Post("/api/channel", [this](const httplib::Request &req, httplib::Response &res) {
-            const auto &body = req.body;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                Json(res, R"({"error":"JSON の解析に失敗しました"})", 400);
+                return;
+            }
             auto wreq = std::make_shared<WriteRequest>();
 
-            int rck = ParseIntField(body, "remoteControlKey");
-            if (rck != INT_MIN) {
-                wreq->type            = WriteRequest::Type::SET_CHANNEL_RCK;
-                wreq->remoteControlKey = rck;
+            if (auto it = body.find("remoteControlKey"); it != body.end() && it->is_number_integer()) {
+                wreq->type             = WriteRequest::Type::SET_CHANNEL_RCK;
+                wreq->remoteControlKey = it->get<int>();
             } else {
-                int sp = ParseIntField(body, "space");
-                int ch = ParseIntField(body, "channel");
-                if (sp == INT_MIN || ch == INT_MIN) {
+                auto sp = body.find("space"), ch = body.find("channel");
+                if (sp == body.end() || !sp->is_number_integer() ||
+                    ch == body.end() || !ch->is_number_integer()) {
                     Json(res, R"({"error":"remoteControlKey または space+channel が必要です"})", 400);
                     return;
                 }
                 wreq->type    = WriteRequest::Type::SET_CHANNEL_SPACE;
-                wreq->space   = sp;
-                wreq->channel = ch;
+                wreq->space   = sp->get<int>();
+                wreq->channel = ch->get<int>();
             }
             Dispatch(wreq);
             Json(res, wreq->responseJson, wreq->success ? 200 : 500);
@@ -760,26 +757,29 @@ private:
         // Body: {"volume":50} or {"mute":true} or both
         // ------------------------------------------------------------------
         m_httpServer.Post("/api/volume", [this](const httplib::Request &req, httplib::Response &res) {
-            const auto &body = req.body;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                Json(res, R"({"error":"JSON の解析に失敗しました"})", 400);
+                return;
+            }
 
-            int vol = ParseIntField(body, "volume");
-            if (vol != INT_MIN) {
+            if (auto it = body.find("volume"); it != body.end() && it->is_number_integer()) {
+                int vol = it->get<int>();
                 if (vol < 0 || vol > 100) {
                     Json(res, R"({"error":"volume は 0〜100 の範囲です"})", 400);
                     return;
                 }
-                auto wreq   = std::make_shared<WriteRequest>();
-                wreq->type  = WriteRequest::Type::SET_VOLUME;
+                auto wreq    = std::make_shared<WriteRequest>();
+                wreq->type   = WriteRequest::Type::SET_VOLUME;
                 wreq->volume = vol;
                 Dispatch(wreq);
                 if (!wreq->success) { Json(res, wreq->responseJson, 500); return; }
             }
 
-            bool muteVal = false;
-            if (ParseBoolField(body, "mute", muteVal)) {
+            if (auto it = body.find("mute"); it != body.end() && it->is_boolean()) {
                 auto wreq  = std::make_shared<WriteRequest>();
                 wreq->type = WriteRequest::Type::SET_MUTE;
-                wreq->mute = muteVal;
+                wreq->mute = it->get<bool>();
                 Dispatch(wreq);
                 if (!wreq->success) { Json(res, wreq->responseJson, 500); return; }
             }
@@ -906,25 +906,31 @@ private:
         //    or {"driver":"BonDriver_Proxy_S.dll","space":0,"channel":0}
         // ------------------------------------------------------------------
         m_httpServer.Post("/api/driver", [this](const httplib::Request &req, httplib::Response &res) {
-            std::string name = ParseStrField(req.body, "driver");
-            if (name.empty()) {
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                Json(res, R"({"error":"JSON の解析に失敗しました"})", 400);
+                return;
+            }
+            auto nameIt = body.find("driver");
+            if (nameIt == body.end() || !nameIt->is_string() || nameIt->get<std::string>().empty()) {
                 Json(res, R"({"error":"driver フィールドが必要です"})", 400);
                 return;
             }
             auto wreq        = std::make_shared<WriteRequest>();
             wreq->type       = WriteRequest::Type::SET_DRIVER;
-            wreq->driverName = StrToWStr(name);
+            wreq->driverName = StrToWStr(nameIt->get<std::string>());
 
-            int rck = ParseIntField(req.body, "remoteControlKey");
-            int sp  = ParseIntField(req.body, "space");
-            int ch  = ParseIntField(req.body, "channel");
-            if (rck != INT_MIN) {
+            auto rckIt = body.find("remoteControlKey");
+            auto spIt  = body.find("space");
+            auto chIt  = body.find("channel");
+            if (rckIt != body.end() && rckIt->is_number_integer()) {
                 wreq->hasChannel       = true;
-                wreq->remoteControlKey = rck;
-            } else if (sp != INT_MIN && ch != INT_MIN) {
+                wreq->remoteControlKey = rckIt->get<int>();
+            } else if (spIt != body.end() && spIt->is_number_integer() &&
+                       chIt != body.end() && chIt->is_number_integer()) {
                 wreq->hasChannel = true;
-                wreq->space      = sp;
-                wreq->channel    = ch;
+                wreq->space      = spIt->get<int>();
+                wreq->channel    = chIt->get<int>();
             }
 
             Dispatch(wreq);

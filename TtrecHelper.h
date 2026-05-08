@@ -3,7 +3,6 @@
 #include "JsonHelpers.h"
 
 #include <windows.h>
-#include <sstream>
 #include <string>
 
 // =============================================================================
@@ -13,7 +12,6 @@
 // Parses UTF-16 LE content of TTRec's _Reserves.txt and returns a JSON array string.
 static std::string BuildTtrecReservesJson(const std::wstring &content)
 {
-    // タブ区切りフィールドを先頭から取り出すラムダ
     auto popField = [](std::wstring &s) -> std::wstring {
         size_t tab = s.find(L'\t');
         if (tab == std::wstring::npos) {
@@ -26,9 +24,8 @@ static std::string BuildTtrecReservesJson(const std::wstring &content)
         return r;
     };
 
-    std::ostringstream j;
-    j << "[";
-    bool first = true;
+    using json = nlohmann::json;
+    json arr = json::array();
     size_t pos = 0;
 
     for (;;) {
@@ -37,7 +34,6 @@ static std::string BuildTtrecReservesJson(const std::wstring &content)
             ? content.substr(pos)
             : content.substr(pos, nl - pos);
         if (nl == std::wstring::npos) {
-            // 最終行
             if (!line.empty() && line.back() == L'\r') line.pop_back();
             pos = content.size() + 1;
         } else {
@@ -74,11 +70,9 @@ static std::string BuildTtrecReservesJson(const std::wstring &content)
         // 番組名 (先頭が PREFIX_EPGORIGIN=0x11 なら除去)
         std::wstring nameW = popField(rest);
         if (!nameW.empty() && nameW[0] == L'\x11') nameW = nameW.substr(1);
-        std::string eventName = JsonStr(nameW);
 
         int startMargin = (int)wcstol(popField(rest).c_str(), nullptr, 10);
         int endMargin   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-        // priority は (PRIORITY - PRIORITY_MOD) で保存。負値 = 見るだけ
         int priorityRel = (int)wcstol(popField(rest).c_str(), nullptr, 10);
         int onStopped   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
         std::wstring saveDirW  = popField(rest);
@@ -89,35 +83,33 @@ static std::string BuildTtrecReservesJson(const std::wstring &content)
         bool isViewOnly = (priorityRel < 0);
         const char *followMode = followFixed ? "fixed" : (followPF ? "following" : "default");
 
-        if (!first) j << ",";
-        first = false;
-        j << "{"
-          << "\"networkId\":"         << networkID  << ","
-          << "\"transportStreamId\":" << tsID       << ","
-          << "\"serviceId\":"         << serviceID  << ","
-          << "\"eventId\":"           << eventID    << ","
-          << "\"startTime\":\""       << startTime  << "\","
-          << "\"duration\":"          << durSec     << ","
-          << "\"eventName\":\""       << eventName  << "\","
-          << "\"isEnabled\":"         << (isEnabled  ? "true" : "false") << ","
-          << "\"isViewOnly\":"        << (isViewOnly ? "true" : "false") << ","
-          << "\"followMode\":\""      << followMode << "\","
-          << "\"recOption\":{"
-          << "\"startMargin\":"  << startMargin << ","
-          << "\"endMargin\":"    << endMargin   << ","
-          << "\"priority\":"     << priorityRel << ","
-          << "\"onStopped\":"    << onStopped   << ","
-          << "\"saveDir\":\""    << JsonStr(saveDirW  == L"*" ? L"" : saveDirW)  << "\","
-          << "\"saveName\":\""   << JsonStr(saveNameW == L"*" ? L"" : saveNameW) << "\","
-          << "\"startTrim\":"    << startTrim   << ","
-          << "\"endTrim\":"      << endTrim
-          << "}"
-          << "}";
+        arr.push_back({
+            {"networkId",         networkID},
+            {"transportStreamId", tsID},
+            {"serviceId",         serviceID},
+            {"eventId",           eventID},
+            {"startTime",         startTime},
+            {"duration",          durSec},
+            {"eventName",         WStrToUtf8(nameW)},
+            {"isEnabled",         isEnabled},
+            {"isViewOnly",        isViewOnly},
+            {"followMode",        followMode},
+            {"recOption", {
+                {"startMargin", startMargin},
+                {"endMargin",   endMargin},
+                {"priority",    priorityRel},
+                {"onStopped",   onStopped},
+                {"saveDir",     WStrToUtf8(saveDirW  == L"*" ? L"" : saveDirW)},
+                {"saveName",    WStrToUtf8(saveNameW == L"*" ? L"" : saveNameW)},
+                {"startTrim",   startTrim},
+                {"endTrim",     endTrim}
+            }}
+        });
 
         if (pos > content.size()) break;
     }
-    j << "]";
-    return j.str();
+
+    return arr.dump();
 }
 
 static bool LoadTtrecReservesJson(HWND hwndTTRec, std::string &json)
@@ -139,7 +131,7 @@ static bool LoadTtrecReservesJson(HWND hwndTTRec, std::string &json)
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) {
-        json = R"([])";
+        json = "[]";
         return true;
     }
 
