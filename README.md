@@ -18,13 +18,13 @@ https://github.com/Ebycow/TVTest-MCPServer や https://github.com/Ebycow/TVTest-
 - 指定チャンネルまたは指定イベントの番組情報取得
 - 複数チャンネルの番組情報一括取得
 - BonDriver 切り替え
-- TTRec 連携（予約一覧取得 / デフォルト設定での番組予約）
+- TTRec 連携（予約一覧取得 / デフォルト設定での番組予約） https://github.com/xtne6f/TTRec
 - IP アドレスによるアクセス制限（許可リスト / 拒否リスト）
 - CORS 対応（ブラウザからの直接アクセス可）
 
-## ビルド・インストール
+## ビルドに関する説明
 
-詳細は [SETUP.md](SETUP.md) を参照してください。
+ビルドに関する説明の詳細は [SETUP.md](SETUP.md) を参照してください。
 
 ### 必要環境
 
