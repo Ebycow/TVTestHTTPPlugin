@@ -4,6 +4,7 @@ static const int      HTTP_PORT_DEFAULT            = 40152;
 static const UINT_PTR TIMER_ID                     = 40152u;
 static const UINT     TIMER_MS                     = 50u;
 static const int      PROGRAM_REFRESH_INTERVAL     = 40;
+static const DWORD    DISPATCH_TIMEOUT_MS          = 3000u;
 
 // TTRec WM_APP message identifiers
 static const UINT WM_TTREC_GET_MSGVER                 = WM_APP + 50;
