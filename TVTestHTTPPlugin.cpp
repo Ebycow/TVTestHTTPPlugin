@@ -17,6 +17,7 @@
  *   GET  /api/record/status         録画状態
  *   POST /api/record/start          録画開始
  *   POST /api/record/stop           録画停止
+ *   GET  /api/ttrec/reserves         TTRec の予約一覧取得
  *   POST /api/ttrec/reserve/default TTRec のデフォルト設定で予約追加
  *
  * GET /api/program/channel クエリパラメータ (いずれか):
@@ -93,6 +94,8 @@ struct EpgQuery {
     WORD networkId  = 0;
     WORD tsId       = 0;
     WORD serviceId  = 0;
+    WORD eventId    = 0;     // hasEventId == true のときのみ有効
+    bool hasEventId = false; // true: EPG_EVENT_QUERY_EVENTID / false: EPG_EVENT_QUERY_TIME
 };
 
 struct TVTestState {
@@ -909,8 +912,9 @@ private:
             break;
 
         case WriteRequest::Type::GET_EPG_EVENT: {
-            FILETIME ft;
-            GetSystemTimeAsFileTime(&ft);
+            FILETIME ft = {};
+            if ([&]{ for (const auto &q : req.epgQueries) if (!q.hasEventId) return true; return false; }())
+                GetSystemTimeAsFileTime(&ft);
 
             const auto &queries = req.epgQueries;
             if (queries.size() == 1) {
@@ -920,9 +924,14 @@ private:
                 qi.NetworkID         = q.networkId;
                 qi.TransportStreamID = q.tsId;
                 qi.ServiceID         = q.serviceId;
-                qi.Type              = TVTest::EPG_EVENT_QUERY_TIME;
                 qi.Flags             = 0;
-                qi.Time              = ft;
+                if (q.hasEventId) {
+                    qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
+                    qi.EventID = q.eventId;
+                } else {
+                    qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
+                    qi.Time  = ft;
+                }
                 TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
                 req.epgResultJson = BuildEpgSingleJson(q, pEvent);
                 if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
@@ -938,9 +947,14 @@ private:
                     qi.NetworkID         = q.networkId;
                     qi.TransportStreamID = q.tsId;
                     qi.ServiceID         = q.serviceId;
-                    qi.Type              = TVTest::EPG_EVENT_QUERY_TIME;
                     qi.Flags             = 0;
-                    qi.Time              = ft;
+                    if (q.hasEventId) {
+                        qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
+                        qi.EventID = q.eventId;
+                    } else {
+                        qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
+                        qi.Time  = ft;
+                    }
                     TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
                     j << BuildEpgSingleJson(q, pEvent);
                     if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
@@ -957,6 +971,24 @@ private:
             static const UINT WM_TTREC_EVENT_PROGRAMGUIDE_COMMAND = WM_APP + 53;
             static const UINT TTREC_CURRENT_MSGVER = 1;
             static const UINT COMMAND_RESERVE_DEFAULT = 2;
+
+            // TVTest の EPG に対象イベントが存在するか確認する
+            {
+                TVTest::EpgEventQueryInfo qi = {};
+                qi.NetworkID         = req.epgQuery.networkId;
+                qi.TransportStreamID = req.epgQuery.tsId;
+                qi.ServiceID         = req.epgQuery.serviceId;
+                qi.Type              = TVTest::EPG_EVENT_QUERY_EVENTID;
+                qi.EventID           = req.eventId;
+                qi.Flags             = 0;
+                TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
+                if (!pEvent) {
+                    req.responseJson =
+                        R"({"error":"指定された番組の EPG 情報が見つかりません。TVTest の番組表が取得されているか確認してください"})";
+                    break;
+                }
+                m_pApp->FreeEpgEventInfo(pEvent);
+            }
 
             HWND hwndTTRec = FindTTRecWindowInCurrentProcess();
             if (!hwndTTRec) {
@@ -1230,6 +1262,168 @@ private:
         });
 
         // ------------------------------------------------------------------
+        // GET /api/ttrec/reserves
+        // TTRec の予約一覧を JSON 配列で返す。
+        // TTRec の HINSTANCE から _Reserves.txt のパスを解決して直接読み込む。
+        // ------------------------------------------------------------------
+        m_httpServer.Get("/api/ttrec/reserves", [](const httplib::Request &, httplib::Response &res) {
+            static constexpr LPCTSTR TTREC_WINDOW_CLASS = TEXT("TVTest TTRec");
+            HWND hwndTTRec = nullptr;
+            while ((hwndTTRec = ::FindWindowEx(nullptr, hwndTTRec, TTREC_WINDOW_CLASS, nullptr)) != nullptr) {
+                DWORD pid = 0;
+                ::GetWindowThreadProcessId(hwndTTRec, &pid);
+                if (pid == ::GetCurrentProcessId()) break;
+                hwndTTRec = nullptr;
+            }
+            if (!hwndTTRec) {
+                Json(res, R"({"error":"TTRec が見つかりません。TVTest に TTRec プラグインを導入して有効化してください"})", 500);
+                return;
+            }
+
+            // TTRec の HINSTANCE から DLL パスを取得し _Reserves.txt のパスを構築
+            HINSTANCE hinstTTRec = reinterpret_cast<HINSTANCE>(
+                ::GetWindowLongPtr(hwndTTRec, GWLP_HINSTANCE));
+            wchar_t dllPath[MAX_PATH] = {};
+            if (!::GetModuleFileNameW(hinstTTRec, dllPath, MAX_PATH)) {
+                Json(res, R"({"error":"TTRec のパスを取得できません"})", 500);
+                return;
+            }
+            wchar_t reservePath[MAX_PATH + 16] = {};
+            ::wcscpy_s(reservePath, dllPath);
+            wchar_t *dot = ::wcsrchr(reservePath, L'.');
+            if (dot) *dot = L'\0';
+            ::wcscat_s(reservePath, L"_Reserves.txt");
+
+            // BOM 付き UTF-16 LE ファイルを読み込む
+            HANDLE hFile = ::CreateFileW(reservePath, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                Json(res, R"([])", 200);  // 予約ファイルなし = 予約なし
+                return;
+            }
+            DWORD fileBytes = ::GetFileSize(hFile, nullptr);
+            std::wstring content;
+            if (fileBytes >= sizeof(wchar_t) * 2) {
+                wchar_t bom = 0;
+                DWORD rd = 0;
+                if (::ReadFile(hFile, &bom, sizeof(wchar_t), &rd, nullptr) && bom == L'\xFEFF') {
+                    DWORD wchars = (fileBytes / sizeof(wchar_t)) - 1;
+                    content.resize(wchars);
+                    ::ReadFile(hFile, &content[0], wchars * sizeof(wchar_t), &rd, nullptr);
+                    content.resize(rd / sizeof(wchar_t));
+                }
+            }
+            ::CloseHandle(hFile);
+
+            // タブ区切りフィールドを先頭から取り出すラムダ
+            auto popField = [](std::wstring &s) -> std::wstring {
+                size_t tab = s.find(L'\t');
+                if (tab == std::wstring::npos) {
+                    std::wstring r;
+                    std::swap(r, s);
+                    return r;
+                }
+                std::wstring r = s.substr(0, tab);
+                s.erase(0, tab + 1);
+                return r;
+            };
+
+            std::ostringstream j;
+            j << "[";
+            bool first = true;
+            size_t pos = 0;
+
+            for (;;) {
+                size_t nl = content.find(L'\n', pos);
+                std::wstring line = (nl == std::wstring::npos)
+                    ? content.substr(pos)
+                    : content.substr(pos, nl - pos);
+                if (nl == std::wstring::npos) {
+                    // 最終行
+                    if (!line.empty() && line.back() == L'\r') line.pop_back();
+                    pos = content.size() + 1;
+                } else {
+                    if (!line.empty() && line.back() == L'\r') line.pop_back();
+                    pos = nl + 1;
+                }
+                if (line.empty()) {
+                    if (pos > content.size()) break;
+                    continue;
+                }
+
+                std::wstring rest = line;
+                int networkID  = (int)wcstol(popField(rest).c_str(), nullptr, 16);
+                int tsID       = (int)wcstol(popField(rest).c_str(), nullptr, 16);
+                int serviceID  = (int)wcstol(popField(rest).c_str(), nullptr, 16);
+                int eventID    = (int)wcstol(popField(rest).c_str(), nullptr, 16);
+                std::string startTime = WStrToUtf8(popField(rest));
+
+                // "hh:mm:ss[!][#][$]"
+                std::wstring durField = popField(rest);
+                int durSec = 0;
+                bool followPF = false, isEnabled = true, followFixed = false;
+                if (durField.size() >= 8) {
+                    durSec = (int)wcstol(durField.substr(0, 2).c_str(), nullptr, 10) * 3600
+                           + (int)wcstol(durField.substr(3, 2).c_str(), nullptr, 10) * 60
+                           + (int)wcstol(durField.substr(6, 2).c_str(), nullptr, 10);
+                    for (size_t k = 8; k < durField.size(); ++k) {
+                        if      (durField[k] == L'!') followPF    = true;
+                        else if (durField[k] == L'#') isEnabled   = false;
+                        else if (durField[k] == L'$') followFixed = true;
+                    }
+                }
+
+                // 番組名 (先頭が PREFIX_EPGORIGIN=0x11 なら除去)
+                std::wstring nameW = popField(rest);
+                if (!nameW.empty() && nameW[0] == L'\x11') nameW = nameW.substr(1);
+                std::string eventName = JsonStr(nameW);
+
+                int startMargin = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+                int endMargin   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+                // priority は (PRIORITY - PRIORITY_MOD) で保存。負値 = 見るだけ
+                int priorityRel = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+                int onStopped   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+                std::wstring saveDirW  = popField(rest);
+                std::wstring saveNameW = popField(rest);
+                int startTrim = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+                int endTrim   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
+
+                bool isViewOnly = (priorityRel < 0);
+                const char *followMode = followFixed ? "fixed" : (followPF ? "following" : "default");
+
+                if (!first) j << ",";
+                first = false;
+                j << "{"
+                  << "\"networkId\":"         << networkID  << ","
+                  << "\"transportStreamId\":" << tsID       << ","
+                  << "\"serviceId\":"         << serviceID  << ","
+                  << "\"eventId\":"           << eventID    << ","
+                  << "\"startTime\":\""       << startTime  << "\","
+                  << "\"duration\":"          << durSec     << ","
+                  << "\"eventName\":\""       << eventName  << "\","
+                  << "\"isEnabled\":"         << (isEnabled  ? "true" : "false") << ","
+                  << "\"isViewOnly\":"        << (isViewOnly ? "true" : "false") << ","
+                  << "\"followMode\":\""      << followMode << "\","
+                  << "\"recOption\":{"
+                  << "\"startMargin\":"  << startMargin << ","
+                  << "\"endMargin\":"    << endMargin   << ","
+                  << "\"priority\":"     << priorityRel << ","
+                  << "\"onStopped\":"    << onStopped   << ","
+                  << "\"saveDir\":\""    << JsonStr(saveDirW  == L"*" ? L"" : saveDirW)  << "\","
+                  << "\"saveName\":\""   << JsonStr(saveNameW == L"*" ? L"" : saveNameW) << "\","
+                  << "\"startTrim\":"    << startTrim   << ","
+                  << "\"endTrim\":"      << endTrim
+                  << "}"
+                  << "}";
+
+                if (pos > content.size()) break;
+            }
+            j << "]";
+            Json(res, j.str(), 200);
+        });
+
+        // ------------------------------------------------------------------
         // GET /api/status
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/status", [this](const httplib::Request &, httplib::Response &res) {
@@ -1386,6 +1580,9 @@ private:
         //   ?space=0&channel=5
         //   ?networkId=32736&serviceId=1024
         //   ?networkId=32736&serviceId=1024&transportStreamId=32736
+        // オプション:
+        //   &eventId=12345  指定すると EPG_EVENT_QUERY_EVENTID で当該イベントを取得
+        //                   省略時は現在放送中の番組を取得 (EPG_EVENT_QUERY_TIME)
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/program/channel", [this](const httplib::Request &req, httplib::Response &res) {
             EpgQuery q = {};
@@ -1426,6 +1623,12 @@ private:
             } else {
                 Json(res, R"({"error":"space+channel または networkId+serviceId が必要です"})", 400);
                 return;
+            }
+
+            // eventId が指定されていれば EPG_EVENT_QUERY_EVENTID を使う
+            if (req.has_param("eventId")) {
+                q.eventId    = static_cast<WORD>(std::stoi(req.get_param_value("eventId")));
+                q.hasEventId = true;
             }
 
             auto wreq = std::make_shared<WriteRequest>();
