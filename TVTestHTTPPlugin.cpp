@@ -69,6 +69,7 @@
 #include "Constants.h"
 #include "Types.h"
 #include "JsonHelpers.h"
+#include "ApiJson.h"
 #include "EpgHelper.h"
 #include "IpFilter.h"
 #include "Settings.h"
@@ -754,40 +755,7 @@ private:
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/status", [this](const httplib::Request &, httplib::Response &res) {
             auto s = SnapState();
-            std::ostringstream j;
-            j << "{";
-
-            // channel
-            if (s.hasChannel) {
-                j << "\"channel\":{"
-                  << "\"space\":"            << s.space            << ","
-                  << "\"channel\":"          << s.channel          << ","
-                  << "\"remoteControlKey\":" << s.remoteControlKey << ","
-                  << "\"serviceId\":"        << s.serviceID        << ","
-                  << "\"networkId\":"        << s.networkID        << ","
-                  << "\"transportStreamId\":" << s.tsID            << ","
-                  << "\"name\":\""           << JsonStr(s.channelName)  << "\","
-                  << "\"networkName\":\""    << JsonStr(s.networkName)  << "\""
-                  << "},";
-            } else {
-                j << "\"channel\":null,";
-            }
-
-            j << "\"volume\":"       << s.volume                              << ","
-              << "\"mute\":"         << (s.mute ? "true" : "false")           << ","
-              << "\"recordStatus\":" << s.recordStatus                        << ","
-              << "\"recording\":"    << (s.recordStatus == TVTest::RECORD_STATUS_RECORDING ? "true" : "false");
-
-            if (s.hasProgramInfo) {
-                j << ",\"program\":{"
-                  << "\"name\":\""  << JsonStr(s.programName) << "\","
-                  << "\"text\":\""  << JsonStr(s.programText) << "\""
-                  << "}";
-            } else {
-                j << ",\"program\":null";
-            }
-            j << "}";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildStatusJson(s, TVTest::RECORD_STATUS_RECORDING));
         });
 
         // ------------------------------------------------------------------
@@ -795,24 +763,7 @@ private:
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/channels", [this](const httplib::Request &, httplib::Response &res) {
             auto s = SnapState();
-            std::ostringstream j;
-            j << "[";
-            bool first = true;
-            for (const auto &e : s.channelList) {
-                if (!first) j << ",";
-                first = false;
-                j << "{"
-                  << "\"space\":"            << e.space            << ","
-                  << "\"channel\":"          << e.channel          << ","
-                  << "\"remoteControlKey\":" << e.remoteControlKey << ","
-                  << "\"serviceId\":"        << e.serviceID        << ","
-                  << "\"networkId\":"        << e.networkID        << ","
-                  << "\"name\":\""           << JsonStr(e.name)        << "\","
-                  << "\"networkName\":\""    << JsonStr(e.networkName) << "\""
-                  << "}";
-            }
-            j << "]";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildChannelsJson(s.channelList));
         });
 
         // ------------------------------------------------------------------
@@ -848,10 +799,7 @@ private:
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/volume", [this](const httplib::Request &, httplib::Response &res) {
             auto s = SnapState();
-            std::ostringstream j;
-            j << "{\"volume\":" << s.volume
-              << ",\"mute\":"   << (s.mute ? "true" : "false") << "}";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildVolumeJson(s));
         });
 
         // ------------------------------------------------------------------
@@ -891,13 +839,7 @@ private:
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/program", [this](const httplib::Request &, httplib::Response &res) {
             auto s = SnapState();
-            if (!s.hasProgramInfo) { Json(res, R"({"program":null})"); return; }
-            std::ostringstream j;
-            j << "{\"program\":{"
-              << "\"name\":\""  << JsonStr(s.programName) << "\","
-              << "\"text\":\""  << JsonStr(s.programText) << "\""
-              << "}}";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildProgramJson(s));
         });
 
         // ------------------------------------------------------------------
@@ -988,11 +930,7 @@ private:
         // ------------------------------------------------------------------
         m_httpServer.Get("/api/record/status", [this](const httplib::Request &, httplib::Response &res) {
             auto s = SnapState();
-            std::ostringstream j;
-            j << "{\"status\":"    << s.recordStatus
-              << ",\"recording\":" << (s.recordStatus == TVTest::RECORD_STATUS_RECORDING ? "true" : "false")
-              << "}";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildRecordStatusJson(s, TVTest::RECORD_STATUS_RECORDING));
         });
 
         // ------------------------------------------------------------------
@@ -1015,18 +953,13 @@ private:
             m_pApp->GetDriverName(cur, MAX_PATH);
 
             // 利用可能なドライバを列挙
-            std::ostringstream j;
-            j << "{\"current\":\"" << JsonStr(std::wstring(cur)) << "\",\"drivers\":[";
-            bool first = true;
+            std::vector<std::wstring> drivers;
             for (int i = 0; ; ++i) {
                 wchar_t name[MAX_PATH] = {};
                 if (m_pApp->EnumDriver(i, name, MAX_PATH) <= 0) break;
-                if (!first) j << ",";
-                first = false;
-                j << "\"" << JsonStr(std::wstring(name)) << "\"";
+                drivers.emplace_back(name);
             }
-            j << "]}";
-            Json(res, j.str());
+            Json(res, TVTestHTTP::BuildDriverJson(cur, drivers));
         });
 
         // ------------------------------------------------------------------
