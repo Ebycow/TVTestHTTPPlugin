@@ -71,6 +71,7 @@
 #include "JsonHelpers.h"
 #include "ApiJson.h"
 #include "EpgHelper.h"
+#include "HttpStateRoutes.h"
 #include "IpFilter.h"
 #include "Settings.h"
 #include "SettingsStore.h"
@@ -648,6 +649,11 @@ private:
             Cors(res);
         });
 
+        TVTestHTTP::RegisterStateRoutes(
+            m_httpServer,
+            [this] { return SnapState(); },
+            TVTest::RECORD_STATUS_RECORDING);
+
         // ------------------------------------------------------------------
         // POST /api/ttrec/reserve/default
         // Body:
@@ -722,22 +728,6 @@ private:
         });
 
         // ------------------------------------------------------------------
-        // GET /api/status
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/status", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            Json(res, TVTestHTTP::BuildStatusJson(s, TVTest::RECORD_STATUS_RECORDING));
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/channels
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/channels", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            Json(res, TVTestHTTP::BuildChannelsJson(s.channelList));
-        });
-
-        // ------------------------------------------------------------------
         // POST /api/channel
         // Body: {"remoteControlKey":3}
         //    or {"space":0,"channel":5}
@@ -763,14 +753,6 @@ private:
             }
             Dispatch(wreq);
             Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/volume
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/volume", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            Json(res, TVTestHTTP::BuildVolumeJson(s));
         });
 
         // ------------------------------------------------------------------
@@ -803,14 +785,6 @@ private:
             }
 
             Json(res, R"({"success":true})");
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/program
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/program", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            Json(res, TVTestHTTP::BuildProgramJson(s));
         });
 
         // ------------------------------------------------------------------
@@ -894,14 +868,6 @@ private:
             wreq->epgQueries = std::move(queries);
             Dispatch(wreq);
             Json(res, wreq->epgResultJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/record/status
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/record/status", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            Json(res, TVTestHTTP::BuildRecordStatusJson(s, TVTest::RECORD_STATUS_RECORDING));
         });
 
         // ------------------------------------------------------------------
