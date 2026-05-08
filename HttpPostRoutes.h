@@ -10,8 +10,23 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 namespace TVTestHTTP {
+
+// クエリパラメータを整数に安全に変換する。変換失敗時は nullopt を返す
+static std::optional<int> SafeParamInt(const httplib::Request &req, const char *key)
+{
+    if (!req.has_param(key)) return std::nullopt;
+    try {
+        size_t pos = 0;
+        int val = std::stoi(req.get_param_value(key), &pos);
+        if (pos != req.get_param_value(key).size()) return std::nullopt; // 末尾に非数値文字
+        return val;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
 
 struct DynamicRouteContext {
     TVTest::CTVTestApp                                 *app;
@@ -132,12 +147,15 @@ static void RegisterDynamicRoutes(httplib::Server &server, DynamicRouteContext c
         EpgQuery q = {};
         auto s = ctx.snapState();
 
-        if (req.has_param("space") && req.has_param("channel")) {
-            int sp = std::stoi(req.get_param_value("space"));
-            int ch = std::stoi(req.get_param_value("channel"));
+        auto sp = SafeParamInt(req, "space");
+        auto ch = SafeParamInt(req, "channel");
+        auto nid = SafeParamInt(req, "networkId");
+        auto sid = SafeParamInt(req, "serviceId");
+
+        if (sp && ch) {
             bool found = false;
             for (const auto &e : s.channelList) {
-                if (e.space == sp && e.channel == ch) {
+                if (e.space == *sp && e.channel == *ch) {
                     q.networkId = static_cast<WORD>(e.networkID);
                     q.tsId      = static_cast<WORD>(e.tsID);
                     q.serviceId = static_cast<WORD>(e.serviceID);
@@ -149,11 +167,12 @@ static void RegisterDynamicRoutes(httplib::Server &server, DynamicRouteContext c
                 SendJson(res, R"({"error":"指定された space+channel が見つかりません"})", 404);
                 return;
             }
-        } else if (req.has_param("networkId") && req.has_param("serviceId")) {
-            q.networkId = static_cast<WORD>(std::stoi(req.get_param_value("networkId")));
-            q.serviceId = static_cast<WORD>(std::stoi(req.get_param_value("serviceId")));
-            if (req.has_param("transportStreamId")) {
-                q.tsId = static_cast<WORD>(std::stoi(req.get_param_value("transportStreamId")));
+        } else if (nid && sid) {
+            q.networkId = static_cast<WORD>(*nid);
+            q.serviceId = static_cast<WORD>(*sid);
+            auto tsid = SafeParamInt(req, "transportStreamId");
+            if (tsid) {
+                q.tsId = static_cast<WORD>(*tsid);
             } else {
                 for (const auto &e : s.channelList) {
                     if (e.networkID == q.networkId && e.serviceID == q.serviceId) {
@@ -167,8 +186,13 @@ static void RegisterDynamicRoutes(httplib::Server &server, DynamicRouteContext c
             return;
         }
 
-        if (req.has_param("eventId")) {
-            q.eventId    = static_cast<WORD>(std::stoi(req.get_param_value("eventId")));
+        auto eid = SafeParamInt(req, "eventId");
+        if (eid) {
+            if (*eid < 0 || *eid > 0xFFFF) {
+                SendJson(res, nlohmann::json{{"error", "eventId は 0〜65535 の範囲で指定してください"}}.dump(), 400);
+                return;
+            }
+            q.eventId    = static_cast<WORD>(*eid);
             q.hasEventId = true;
         }
 
