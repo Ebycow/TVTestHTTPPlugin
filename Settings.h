@@ -29,15 +29,19 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         _itow_s(data->settings.port, portStr, 10);
         SetDlgItemTextW(hwnd, IDC_PORT, portStr);
 
-        // 許可リスト: カンマ → 改行に変換して表示
-        std::wstring allow = data->settings.allowList;
-        for (auto &c : allow) if (c == L',') c = L'\n';
-        SetDlgItemTextW(hwnd, IDC_ALLOW, allow.c_str());
+        // 許可リスト: カンマ → \r\n に変換して表示
+        auto ToMultiline = [](const std::wstring &src) {
+            std::wstring out;
+            for (wchar_t c : src) {
+                if (c == L',') { out += L'\r'; out += L'\n'; }
+                else out += c;
+            }
+            return out;
+        };
+        SetDlgItemTextW(hwnd, IDC_ALLOW, ToMultiline(data->settings.allowList).c_str());
 
         // 拒否リスト
-        std::wstring deny = data->settings.denyList;
-        for (auto &c : deny) if (c == L',') c = L'\n';
-        SetDlgItemTextW(hwnd, IDC_DENY, deny.c_str());
+        SetDlgItemTextW(hwnd, IDC_DENY, ToMultiline(data->settings.denyList).c_str());
 
         return TRUE;
     }
