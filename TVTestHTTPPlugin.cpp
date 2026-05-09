@@ -63,6 +63,7 @@ class CTVTestHTTPPlugin : public TVTest::CTVTestPlugin
     httplib::Server   m_httpServer;
     std::thread       m_httpThread;
     bool              m_serverStarted = false;
+    bool              m_routesConfigured = false;
 
     mutable std::mutex m_stateMutex;
     TVTestState        m_state;
@@ -349,11 +350,20 @@ private:
     void StartServer()
     {
         if (m_serverStarted) return;
-        SetupRoutes();
-        m_serverStarted = true;
+        if (!m_routesConfigured) {
+            SetupRoutes();
+            m_routesConfigured = true;
+        }
         int port = m_settings.port;
-        m_httpThread = std::thread([this, port] {
-            m_httpServer.listen("0.0.0.0", port);
+
+        if (!m_httpServer.bind_to_port("0.0.0.0", port)) {
+            m_httpServer.stop();
+            return;
+        }
+
+        m_serverStarted = true;
+        m_httpThread = std::thread([this] {
+            m_httpServer.listen_after_bind();
         });
     }
 

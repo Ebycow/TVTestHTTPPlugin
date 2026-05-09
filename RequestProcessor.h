@@ -95,6 +95,7 @@ static void ProcessWriteRequest(WriteRequest &req, const RequestProcessContext &
         if (req.success) {
             ctx.refreshChannelList();
             if (req.hasChannel) {
+                bool channelChanged = true;
                 if (req.remoteControlKey != 0) {
                     bool found = false;
                     std::vector<ChannelEntry> list;
@@ -104,18 +105,25 @@ static void ProcessWriteRequest(WriteRequest &req, const RequestProcessContext &
                     }
                     for (const auto &e : list) {
                         if (e.remoteControlKey == req.remoteControlKey) {
-                            ctx.app->SetChannel(e.space, e.channel);
+                            channelChanged = ctx.app->SetChannel(e.space, e.channel) != FALSE;
                             found = true;
                             break;
                         }
                     }
                     if (!found) {
+                        req.success      = false;
                         req.responseJson = R"({"error":"ドライバ切り替え成功。ただし指定リモコンキーが見つかりません"})";
                         ctx.refreshChannel();
                         break;
                     }
                 } else {
-                    ctx.app->SetChannel(req.space, req.channel);
+                    channelChanged = ctx.app->SetChannel(req.space, req.channel) != FALSE;
+                }
+                if (!channelChanged) {
+                    req.success      = false;
+                    req.responseJson = R"({"error":"ドライバ切り替え成功。ただしチャンネル変更に失敗しました"})";
+                    ctx.refreshChannel();
+                    break;
                 }
             }
             ctx.refreshChannel();
