@@ -5,29 +5,6 @@
  * TVTest を HTTP REST API 経由で外部から制御するプラグイン。
  * デフォルトポート: 40152
  *
- * エンドポイント:
- *   GET  /api/status                現在の状態（チャンネル・音量・録画・番組）
- *   GET  /api/channels              チャンネル一覧
- *   POST /api/channel               チャンネル変更
- *   GET  /api/volume                音量取得
- *   POST /api/volume                音量・ミュート設定
- *   GET  /api/program               現在番組情報
- *   GET  /api/program/channel       任意チャンネルの現在番組取得
- *   POST /api/program/channels      複数チャンネルの現在番組一括取得
- *   GET  /api/record/status         録画状態
- *   POST /api/record/start          録画開始
- *   POST /api/record/stop           録画停止
- *   GET  /api/ttrec/reserves         TTRec の予約一覧取得
- *   POST /api/ttrec/reserve/default TTRec のデフォルト設定で予約追加
- *
- * GET /api/program/channel クエリパラメータ (いずれか):
- *   ?space=0&channel=5
- *   ?networkId=32736&serviceId=1024
- *   ?networkId=32736&serviceId=1024&transportStreamId=32736
- *
- * POST /api/program/channels ボディ (JSON配列):
- *   [{"space":0,"channel":5}, {"networkId":32736,"serviceId":1024}]
- *
  * スレッド安全設計:
  *   - TVTest API は必ずメインスレッドから呼ぶ (SDK 制約)
  *   - GET: キャッシュから読む (mutex 保護, HTTP スレッドから OK)
@@ -39,14 +16,11 @@
 #include <windows.h>
 
 // `interface` マクロ (TVTestPlugin.h の FilterGraphInfo で使用)
-// objbase.h が basetyps.h 経由で `interface` を struct として定義する
 #include <objbase.h>
 
 // TVTest Plugin SDK
 // ・Shift-JIS コメント警告 C4828 を抑制
 // ・httplib.h より先にインクルード必須
-//   (httplib.h が NOMINMAX を定義して windows.h の min/max マクロを消す前に
-//    TVTestPlugin.h を通しておく必要があるため)
 #pragma warning(push)
 #pragma warning(disable: 4828)
 #define TVTEST_PLUGIN_CLASS_IMPLEMENT
@@ -57,7 +31,6 @@
 #include "httplib.h"
 
 #include <string>
-#include <sstream>
 #include <thread>
 #include <mutex>
 #include <queue>
@@ -66,599 +39,40 @@
 
 #include "resource.h"
 
-// =============================================================================
-// 定数
-// =============================================================================
-
-static const int    HTTP_PORT_DEFAULT = 40152;
-static const UINT_PTR TIMER_ID        = 40152u;
-static const UINT   TIMER_MS          = 50u;   // 書き込みリクエスト処理間隔
-
-// =============================================================================
-// 状態キャッシュ (メインスレッドで書き、HTTP スレッドで読む)
-// =============================================================================
-
-struct ChannelEntry {
-    int          space;
-    int          channel;
-    int          remoteControlKey;
-    int          serviceID;
-    int          networkID;
-    int          tsID;
-    std::wstring name;
-    std::wstring networkName;
-};
-
-// EPG クエリ用 ID セット
-struct EpgQuery {
-    WORD networkId  = 0;
-    WORD tsId       = 0;
-    WORD serviceId  = 0;
-    WORD eventId    = 0;     // hasEventId == true のときのみ有効
-    bool hasEventId = false; // true: EPG_EVENT_QUERY_EVENTID / false: EPG_EVENT_QUERY_TIME
-};
-
-struct TVTestState {
-    // チャンネル
-    bool         hasChannel       = false;
-    int          space            = 0;
-    int          channel          = 0;
-    int          remoteControlKey = 0;
-    int          serviceID        = 0;
-    int          networkID        = 0;
-    int          tsID             = 0;
-    std::wstring channelName;
-    std::wstring networkName;
-
-    // 音量
-    int          volume           = 100;
-    bool         mute             = false;
-
-    // 録画
-    int          recordStatus     = 0;   // RECORD_STATUS_*
-
-    // 現在番組
-    bool         hasProgramInfo   = false;
-    std::wstring programName;
-    std::wstring programText;
-
-    // チャンネル一覧 (初期化時に取得)
-    std::vector<ChannelEntry> channelList;
-};
-
-// =============================================================================
-// 書き込みリクエスト (HTTP スレッド → メインスレッド)
-// =============================================================================
-
-struct WriteRequest {
-    enum class Type {
-        SET_CHANNEL_RCK,    // リモコンキー番号でチャンネル変更
-        SET_CHANNEL_SPACE,  // space + channel インデックスで変更
-        SET_VOLUME,
-        SET_MUTE,
-        START_RECORD,
-        STOP_RECORD,
-        SET_DRIVER,
-        GET_EPG_EVENT,      // 任意チャンネルの現在番組取得 (単体または複数)
-        TTREC_RESERVE_DEFAULT,
-    };
-
-    Type         type;
-    int          remoteControlKey = 0;
-    int          space            = 0;
-    int          channel          = 0;
-    int          volume           = 0;
-    bool         mute             = false;
-    std::wstring driverName;
-    bool         hasChannel       = false; // ドライバ切り替え後にチャンネルを指定するか
-    EpgQuery      epgQuery        = {};
-    WORD          eventId         = 0;
-    SYSTEMTIME    startTime       = {};
-    DWORD         duration        = 0;
-
-    // GET_EPG_EVENT 用
-    std::vector<EpgQuery> epgQueries;  // 取得対象 (1件または複数)
-    std::string           epgResultJson; // 結果 JSON (単体は object, 複数は array)
-
-    // 結果 (メインスレッドが書き, HTTP スレッドが読む)
-    bool         success          = false;
-    std::string  responseJson;
-    HANDLE       hDone;
-
-    WriteRequest()  : hDone(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
-    ~WriteRequest() { if (hDone) CloseHandle(hDone); }
-
-    // コピー禁止
-    WriteRequest(const WriteRequest &)            = delete;
-    WriteRequest &operator=(const WriteRequest &) = delete;
-};
-
-// =============================================================================
-// JSON ヘルパー
-// =============================================================================
-
-static std::string WStrToUtf8(const std::wstring &ws)
-{
-    if (ws.empty()) return {};
-    int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string s(static_cast<size_t>(n - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, s.data(), n, nullptr, nullptr);
-    return s;
-}
-
-static bool ParseIso8601Local(const std::string &value, SYSTEMTIME &st)
-{
-    if (value.size() < 19) return false;
-
-    auto is_digit = [](char c) { return c >= '0' && c <= '9'; };
-    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u, 11u, 12u, 14u, 15u, 17u, 18u}) {
-        if (!is_digit(value[i])) return false;
-    }
-    if (value[4] != '-' || value[7] != '-' || (value[10] != 'T' && value[10] != ' ') ||
-        value[13] != ':' || value[16] != ':') {
-        return false;
-    }
-
-    st = {};
-    st.wYear   = static_cast<WORD>(std::stoi(value.substr(0, 4)));
-    st.wMonth  = static_cast<WORD>(std::stoi(value.substr(5, 2)));
-    st.wDay    = static_cast<WORD>(std::stoi(value.substr(8, 2)));
-    st.wHour   = static_cast<WORD>(std::stoi(value.substr(11, 2)));
-    st.wMinute = static_cast<WORD>(std::stoi(value.substr(14, 2)));
-    st.wSecond = static_cast<WORD>(std::stoi(value.substr(17, 2)));
-
-    FILETIME ft = {};
-    return SystemTimeToFileTime(&st, &ft) != FALSE;
-}
-
-// wstring → UTF-8 std::string (WStrToUtf8 の別名)
-static inline std::string WStrToStr(const std::wstring &ws) { return WStrToUtf8(ws); }
-
-// UTF-8 std::string → wstring
-static std::wstring StrToWStr(const std::string &s)
-{
-    if (s.empty()) return {};
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring ws(static_cast<size_t>(n - 1), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, ws.data(), n);
-    return ws;
-}
-
-// JSON ボディから文字列フィールドを取得。キーが無ければ空文字列を返す
-static std::string ParseStrField(const std::string &json, const char *key)
-{
-    std::string needle = std::string("\"") + key + "\"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return {};
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-    if (pos >= json.size() || json[pos] != '"') return {};
-    ++pos;
-    std::string val;
-    while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos + 1 < json.size()) { ++pos; }
-        val += json[pos++];
-    }
-    return val;
-}
-
-static std::string JsonStr(const std::wstring &ws)
-{
-    std::string src = WStrToUtf8(ws);
-    std::string r;
-    r.reserve(src.size() + 4);
-    for (unsigned char c : src) {
-        if      (c == '"')  r += "\\\"";
-        else if (c == '\\') r += "\\\\";
-        else if (c == '\n') r += "\\n";
-        else if (c == '\r') r += "\\r";
-        else if (c == '\t') r += "\\t";
-        else if (c < 0x20)  {}        // 制御文字は除去
-        else                r += static_cast<char>(c);
-    }
-    return r;
-}
-
-// JSON ボディから整数フィールドを取得。キーが無ければ INT_MIN を返す
-static int ParseIntField(const std::string &json, const char *key)
-{
-    std::string needle = std::string("\"") + key + "\"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return INT_MIN;
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-    if (pos >= json.size()) return INT_MIN;
-    if (json[pos] == '"' || json[pos] == 't' || json[pos] == 'f') return INT_MIN;
-    int sign = 1;
-    if (json[pos] == '-') { sign = -1; ++pos; }
-    if (pos >= json.size() || !isdigit(static_cast<unsigned char>(json[pos]))) return INT_MIN;
-    int val = 0;
-    while (pos < json.size() && isdigit(static_cast<unsigned char>(json[pos])))
-        val = val * 10 + (json[pos++] - '0');
-    return val * sign;
-}
-
-// JSON ボディから bool フィールドを取得。見つかれば true を返す
-static bool ParseBoolField(const std::string &json, const char *key, bool &out)
-{
-    std::string needle = std::string("\"") + key + "\"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return false;
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-    if (pos + 4 <= json.size() && json.substr(pos, 4) == "true")  { out = true;  return true; }
-    if (pos + 5 <= json.size() && json.substr(pos, 5) == "false") { out = false; return true; }
-    return false;
-}
-
-// =============================================================================
-// EPG ヘルパー
-// =============================================================================
-
-// SYSTEMTIME (JST=UTC+9 固定) → "YYYY-MM-DDTHH:MM:SS+09:00"
-static std::string SystemTimeToIso8601(const SYSTEMTIME &st)
-{
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+09:00",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
-    return buf;
-}
-
-// 現在のローカル時刻 → "YYYY-MM-DDTHH:MM:SS"
-static std::string NowLocalIso8601()
-{
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
-    return buf;
-}
-
-// SYSTEMTIME に秒を加算する (JST 日時の終了時刻計算用)
-static SYSTEMTIME AddSeconds(const SYSTEMTIME &st, DWORD seconds)
-{
-    FILETIME ft;
-    SystemTimeToFileTime(&st, &ft);
-    ULONGLONG ull = ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    ull += (ULONGLONG)seconds * 10000000ULL; // 秒 → 100ns 単位
-    ft.dwHighDateTime = (DWORD)(ull >> 32);
-    ft.dwLowDateTime  = (DWORD)(ull & 0xFFFFFFFF);
-    SYSTEMTIME result = {};
-    FileTimeToSystemTime(&ft, &result);
-    return result;
-}
-
-// EpgQuery + EpgEventInfo* から JSON オブジェクト文字列を組み立てる
-// pEvent が nullptr の場合は status:"unavailable"
-static std::string BuildEpgSingleJson(const EpgQuery &q, TVTest::EpgEventInfo *pEvent)
-{
-    std::ostringstream j;
-    j << "{"
-      << "\"networkId\":"         << q.networkId << ","
-      << "\"transportStreamId\":" << q.tsId      << ","
-      << "\"serviceId\":"         << q.serviceId << ","
-      << "\"fetchedAt\":\""       << NowLocalIso8601() << "\",";
-
-    if (pEvent) {
-        SYSTEMTIME endSt = AddSeconds(pEvent->StartTime, pEvent->Duration);
-        j << "\"status\":\"available\","
-          << "\"program\":{"
-          << "\"eventId\":"     << pEvent->EventID << ","
-          << "\"name\":\""      << (pEvent->pszEventName ? JsonStr(std::wstring(pEvent->pszEventName)) : "") << "\","
-          << "\"text\":\""      << (pEvent->pszEventText ? JsonStr(std::wstring(pEvent->pszEventText)) : "") << "\","
-          << "\"startTime\":\"" << SystemTimeToIso8601(pEvent->StartTime) << "\","
-          << "\"endTime\":\""   << SystemTimeToIso8601(endSt) << "\","
-          << "\"duration\":"    << pEvent->Duration
-          << "}}";
-    } else {
-        j << "\"status\":\"unavailable\",\"program\":null}";
-    }
-    return j.str();
-}
-
-static HWND FindTTRecWindowInCurrentProcess()
-{
-    static constexpr LPCTSTR TTREC_WINDOW_CLASS = TEXT("TVTest TTRec");
-    HWND hwnd = nullptr;
-    while ((hwnd = ::FindWindowEx(nullptr, hwnd, TTREC_WINDOW_CLASS, nullptr)) != nullptr) {
-        DWORD pid = 0;
-        ::GetWindowThreadProcessId(hwnd, &pid);
-        if (pid == ::GetCurrentProcessId()) return hwnd;
-    }
-    return nullptr;
-}
-
-// JSON オブジェクト文字列と channelList から EpgQuery を解決する。
-// 解決できた場合 true を返す。
-static bool ResolveEpgQuery(const std::string &obj,
-                             const std::vector<ChannelEntry> &channelList,
-                             EpgQuery &q)
-{
-    int sp        = ParseIntField(obj, "space");
-    int ch        = ParseIntField(obj, "channel");
-    int networkId = ParseIntField(obj, "networkId");
-    int serviceId = ParseIntField(obj, "serviceId");
-    int tsId      = ParseIntField(obj, "transportStreamId");
-    if (networkId == INT_MIN) networkId = ParseIntField(obj, "onid");
-    if (serviceId == INT_MIN) serviceId = ParseIntField(obj, "sid");
-    if (tsId == INT_MIN) tsId = ParseIntField(obj, "tsid");
-
-    if (sp != INT_MIN && ch != INT_MIN) {
-        // space + channel → channelList から ID を補完
-        for (const auto &e : channelList) {
-            if (e.space == sp && e.channel == ch) {
-                q.networkId = static_cast<WORD>(e.networkID);
-                q.tsId      = static_cast<WORD>(e.tsID);
-                q.serviceId = static_cast<WORD>(e.serviceID);
-                return true;
-            }
-        }
-        return false; // 見つからない
-    }
-
-    if (networkId != INT_MIN && serviceId != INT_MIN) {
-        q.networkId = static_cast<WORD>(networkId);
-        q.serviceId = static_cast<WORD>(serviceId);
-        if (tsId != INT_MIN) {
-            q.tsId = static_cast<WORD>(tsId);
-        } else {
-            // channelList から tsId を補完 (見つからなくても続行)
-            for (const auto &e : channelList) {
-                if (e.networkID == networkId && e.serviceID == serviceId) {
-                    q.tsId = static_cast<WORD>(e.tsID);
-                    break;
-                }
-            }
-        }
-        return true;
-    }
-
-    return false;
-}
-
-// JSON 配列文字列を解析して EpgQuery のベクタを返す
-static std::vector<EpgQuery> ParseEpgQueryArray(const std::string &json,
-                                                 const std::vector<ChannelEntry> &channelList)
-{
-    std::vector<EpgQuery> result;
-    int depth = 0;
-    size_t start = std::string::npos;
-    for (size_t i = 0; i < json.size(); ++i) {
-        if (json[i] == '{') {
-            if (depth == 0) start = i;
-            ++depth;
-        } else if (json[i] == '}') {
-            --depth;
-            if (depth == 0 && start != std::string::npos) {
-                std::string obj = json.substr(start, i - start + 1);
-                EpgQuery q;
-                if (ResolveEpgQuery(obj, channelList, q))
-                    result.push_back(q);
-                start = std::string::npos;
-            }
-        }
-    }
-    return result;
-}
-
-// =============================================================================
-// 設定
-// =============================================================================
-
-struct PluginSettings {
-    int          port      = HTTP_PORT_DEFAULT;
-    std::wstring allowList; // カンマ区切り CIDR (例: 192.168.1.0/24,10.0.0.0/8)
-    std::wstring denyList;  // カンマ区切り CIDR
-};
-
-// =============================================================================
-// IP フィルター (CIDR マッチング)
-// =============================================================================
-
-struct CidrBlock {
-    uint32_t addr = 0; // ネットワークアドレス (ホストバイトオーダー)
-    uint32_t mask = 0; // サブネットマスク (ホストバイトオーダー)
-};
-
-// "x.x.x.x/prefix" または "x.x.x.x" を CidrBlock に変換。失敗時 false
-static bool ParseCidr(const std::string &s, CidrBlock &block)
-{
-    // 前後の空白を除去
-    size_t first = s.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return false;
-    size_t last = s.find_last_not_of(" \t\r\n");
-    std::string t = s.substr(first, last - first + 1);
-
-    int prefix = 32;
-    size_t slash = t.find('/');
-    std::string ipStr = (slash != std::string::npos) ? t.substr(0, slash) : t;
-    if (slash != std::string::npos) {
-        try { prefix = std::stoi(t.substr(slash + 1)); }
-        catch (...) { return false; }
-    }
-    if (prefix < 0 || prefix > 32) return false;
-
-    in_addr ia = {};
-    if (inet_pton(AF_INET, ipStr.c_str(), &ia) != 1) return false;
-
-    block.addr = ntohl(ia.s_addr);
-    block.mask = (prefix == 0) ? 0u : (~0u << (32 - prefix));
-    return true;
-}
-
-// ipStr が blocks のいずれかにマッチするか
-static bool IpMatchesList(const std::string &ipStr, const std::vector<CidrBlock> &blocks)
-{
-    if (blocks.empty()) return false;
-    in_addr ia = {};
-    if (inet_pton(AF_INET, ipStr.c_str(), &ia) != 1) return false;
-    uint32_t ip = ntohl(ia.s_addr);
-    for (const auto &b : blocks) {
-        if ((ip & b.mask) == (b.addr & b.mask)) return true;
-    }
-    return false;
-}
-
-// カンマ・改行区切りの CIDR 文字列をパースして CidrBlock のリストを返す
-static std::vector<CidrBlock> ParseCidrList(const std::wstring &wlist)
-{
-    std::vector<CidrBlock> result;
-    std::string list = WStrToUtf8(wlist);
-    std::string cur;
-    for (char c : list) {
-        if (c == ',' || c == '\n' || c == '\r') {
-            if (!cur.empty()) {
-                CidrBlock b;
-                if (ParseCidr(cur, b)) result.push_back(b);
-                cur.clear();
-            }
-        } else {
-            cur += c;
-        }
-    }
-    if (!cur.empty()) {
-        CidrBlock b;
-        if (ParseCidr(cur, b)) result.push_back(b);
-    }
-    return result;
-}
-
-// =============================================================================
-// INI ファイルパス
-// =============================================================================
-
-// DLL と同じフォルダに "TVTestHTTPPlugin.ini" を置く
-// g_hinstDLL は TVTestPlugin.h の TVTEST_PLUGIN_CLASS_IMPLEMENT マクロが定義する
-static std::wstring GetIniFilePath()
-{
-    wchar_t path[MAX_PATH] = {};
-    GetModuleFileNameW(g_hinstDLL, path, MAX_PATH);
-    // 拡張子を .ini に置換
-    wchar_t *dot = wcsrchr(path, L'.');
-    if (dot) wcscpy_s(dot, MAX_PATH - (dot - path), L".ini");
-    else wcscat_s(path, MAX_PATH, L".ini");
-    return path;
-}
-
-// =============================================================================
-// 設定ダイアログ
-// =============================================================================
-
-struct SettingsDlgData {
-    PluginSettings settings;
-};
-
-static INT_PTR CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg) {
-
-    case WM_INITDIALOG: {
-        SetWindowLongPtr(hwnd, DWLP_USER, lParam);
-        auto *data = reinterpret_cast<SettingsDlgData *>(lParam);
-
-        // ポート
-        wchar_t portStr[16] = {};
-        _itow_s(data->settings.port, portStr, 10);
-        SetDlgItemTextW(hwnd, IDC_PORT, portStr);
-
-        // 許可リスト: カンマ → 改行に変換して表示
-        std::wstring allow = data->settings.allowList;
-        for (auto &c : allow) if (c == L',') c = L'\n';
-        SetDlgItemTextW(hwnd, IDC_ALLOW, allow.c_str());
-
-        // 拒否リスト
-        std::wstring deny = data->settings.denyList;
-        for (auto &c : deny) if (c == L',') c = L'\n';
-        SetDlgItemTextW(hwnd, IDC_DENY, deny.c_str());
-
-        return TRUE;
-    }
-
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-
-        case IDOK: {
-            auto *data = reinterpret_cast<SettingsDlgData *>(
-                GetWindowLongPtr(hwnd, DWLP_USER));
-
-            // ポート検証
-            wchar_t portStr[16] = {};
-            GetDlgItemTextW(hwnd, IDC_PORT, portStr, _countof(portStr));
-            int port = _wtoi(portStr);
-            if (port < 1024 || port > 65535) {
-                MessageBoxW(hwnd,
-                    L"ポート番号は 1024〜65535 の範囲で入力してください",
-                    L"入力エラー", MB_ICONWARNING | MB_OK);
-                SetFocus(GetDlgItem(hwnd, IDC_PORT));
-                return TRUE;
-            }
-            data->settings.port = port;
-
-            // 許可リスト: \r\n → カンマに変換して保存
-            auto ReadList = [&](int ctrlId) -> std::wstring {
-                wchar_t buf[4096] = {};
-                GetDlgItemTextW(hwnd, ctrlId, buf, _countof(buf));
-                std::wstring result;
-                for (wchar_t c : std::wstring(buf)) {
-                    if (c == L'\r') continue;
-                    if (c == L'\n') {
-                        if (!result.empty() && result.back() != L',') result += L',';
-                    } else {
-                        result += c;
-                    }
-                }
-                // 末尾のカンマを除去
-                while (!result.empty() && result.back() == L',') result.pop_back();
-                return result;
-            };
-
-            data->settings.allowList = ReadList(IDC_ALLOW);
-            data->settings.denyList  = ReadList(IDC_DENY);
-
-            EndDialog(hwnd, IDOK);
-            return TRUE;
-        }
-
-        case IDCANCEL:
-            EndDialog(hwnd, IDCANCEL);
-            return TRUE;
-        }
-        break;
-    }
-    return FALSE;
-}
+#include "Constants.h"
+#include "Types.h"
+#include "JsonHelpers.h"
+#include "ApiJson.h"
+#include "EpgHelper.h"
+#include "HttpStateRoutes.h"
+#include "HttpPostRoutes.h"
+#include "RequestProcessor.h"
+#include "IpFilter.h"
+#include "Settings.h"
+#include "SettingsStore.h"
+#include "TtrecHelper.h"
 
 // =============================================================================
 // プラグイン本体
 // =============================================================================
 
-// タイマーコールバックから this を取得するための静的ポインタ
-// (プラグインは TVTest に 1 インスタンスのみ)
 static class CTVTestHTTPPlugin *s_pPlugin = nullptr;
 
 class CTVTestHTTPPlugin : public TVTest::CTVTestPlugin
 {
-    // HTTP サーバー
     httplib::Server   m_httpServer;
     std::thread       m_httpThread;
     bool              m_serverStarted = false;
+    bool              m_routesConfigured = false;
 
-    // 状態キャッシュ
     mutable std::mutex m_stateMutex;
     TVTestState        m_state;
 
-    // 書き込みリクエストキュー
     std::mutex                                    m_queueMutex;
     std::queue<std::shared_ptr<WriteRequest>>     m_requestQueue;
 
-    // 番組情報定期更新カウンター (50ms × 40 = 2秒ごとに RefreshProgram)
     int m_programRefreshTick = 0;
-    static const int PROGRAM_REFRESH_INTERVAL = 40;
 
-    // 設定 (メインスレッドから読み書き; HTTP スレッドからは m_settingsMutex で保護)
     mutable std::mutex       m_settingsMutex;
     PluginSettings           m_settings;
     std::vector<CidrBlock>   m_allowBlocks;
@@ -689,7 +103,6 @@ public:
         UpdateCidrBlocks();
         m_pApp->SetEventCallback(EventCallback, this);
         SetTimer(m_pPluginParam->hwndApp, TIMER_ID, TIMER_MS, TimerProc);
-        // 起動時に既に有効状態の場合、EVENT_PLUGINENABLE が来ないのでここで起動する
         if (m_pApp->IsPluginEnabled()) {
             RefreshAll();
             StartServer();
@@ -714,19 +127,14 @@ private:
         auto *self = static_cast<CTVTestHTTPPlugin *>(data);
         switch (event) {
         case TVTest::EVENT_PLUGINENABLE:
-            if (p1) {
-                self->RefreshAll();
-                self->StartServer();
-            } else {
-                self->StopServer();
-            }
+            if (p1) { self->RefreshAll(); self->StartServer(); }
+            else      self->StopServer();
             return TRUE;
 
         case TVTest::EVENT_PLUGINSETTINGS:
             return self->OnPluginSettings(reinterpret_cast<HWND>(p1)) ? TRUE : FALSE;
 
         case TVTest::EVENT_CHANNELCHANGE:
-            // チャンネルリストが未取得の場合（起動時に空だった）はここで取得する
             {
                 bool needList = false;
                 {
@@ -797,7 +205,6 @@ private:
             ProcessRequest(*req);
         }
 
-        // 2秒ごとに番組情報を更新 (EPG受信後の反映に対応)
         if (++m_programRefreshTick >= PROGRAM_REFRESH_INTERVAL) {
             m_programRefreshTick = 0;
             RefreshProgram();
@@ -806,229 +213,13 @@ private:
 
     void ProcessRequest(WriteRequest &req)
     {
-        switch (req.type) {
-
-        case WriteRequest::Type::SET_CHANNEL_RCK: {
-            bool found = false;
-            std::vector<ChannelEntry> list;
-            {
-                std::lock_guard<std::mutex> lk(m_stateMutex);
-                list = m_state.channelList;
-            }
-            for (const auto &e : list) {
-                if (e.remoteControlKey == req.remoteControlKey) {
-                    req.success = m_pApp->SetChannel(e.space, e.channel) != FALSE;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                req.success      = false;
-                req.responseJson = R"({"error":"指定リモコンキーのチャンネルが見つかりません"})";
-            } else if (req.success) {
-                req.responseJson = R"({"success":true})";
-                RefreshChannel();
-            } else {
-                req.responseJson = R"({"error":"チャンネル変更に失敗しました"})";
-            }
-            break;
-        }
-
-        case WriteRequest::Type::SET_CHANNEL_SPACE:
-            req.success = m_pApp->SetChannel(req.space, req.channel) != FALSE;
-            if (req.success) {
-                req.responseJson = R"({"success":true})";
-                RefreshChannel();
-            } else {
-                req.responseJson = R"({"error":"チャンネル変更に失敗しました"})";
-            }
-            break;
-
-        case WriteRequest::Type::SET_VOLUME:
-            req.success      = m_pApp->SetVolume(req.volume) != FALSE;
-            req.responseJson = req.success ? R"({"success":true})"
-                                           : R"({"error":"音量設定に失敗しました"})";
-            break;
-
-        case WriteRequest::Type::SET_MUTE:
-            req.success      = m_pApp->SetMute(req.mute) != FALSE;
-            req.responseJson = req.success ? R"({"success":true})"
-                                           : R"({"error":"ミュート設定に失敗しました"})";
-            break;
-
-        case WriteRequest::Type::START_RECORD: {
-            TVTest::RecordInfo ri = {};
-            ri.Size          = sizeof(ri);
-            ri.Mask          = 0;
-            ri.StartTimeSpec = TVTest::RECORD_START_NOTSPECIFIED;
-            ri.StopTimeSpec  = TVTest::RECORD_STOP_NOTSPECIFIED;
-            req.success      = m_pApp->StartRecord(&ri) != FALSE;
-            req.responseJson = req.success ? R"({"success":true})"
-                                           : R"({"error":"録画開始に失敗しました"})";
-            break;
-        }
-
-        case WriteRequest::Type::SET_DRIVER:
-            req.success = m_pApp->SetDriverName(req.driverName.c_str());
-            if (req.success) {
-                RefreshChannelList();
-                // チャンネル指定があれば続けてチューニング
-                if (req.hasChannel) {
-                    if (req.remoteControlKey != 0) {
-                        // remoteControlKey で検索
-                        bool found = false;
-                        std::vector<ChannelEntry> list;
-                        {
-                            std::lock_guard<std::mutex> lk(m_stateMutex);
-                            list = m_state.channelList;
-                        }
-                        for (const auto &e : list) {
-                            if (e.remoteControlKey == req.remoteControlKey) {
-                                m_pApp->SetChannel(e.space, e.channel);
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (!found) {
-                            req.responseJson = R"({"error":"ドライバ切り替え成功。ただし指定リモコンキーが見つかりません"})";
-                            RefreshChannel();
-                            break;
-                        }
-                    } else {
-                        m_pApp->SetChannel(req.space, req.channel);
-                    }
-                }
-                RefreshChannel();
-                req.responseJson = R"({"success":true})";
-            } else {
-                req.responseJson = R"({"error":"BonDriver の切り替えに失敗しました"})";
-            }
-            break;
-
-        case WriteRequest::Type::STOP_RECORD:
-            req.success      = m_pApp->StopRecord() != FALSE;
-            req.responseJson = req.success ? R"({"success":true})"
-                                           : R"({"error":"録画停止に失敗しました"})";
-            break;
-
-        case WriteRequest::Type::GET_EPG_EVENT: {
-            FILETIME ft = {};
-            if ([&]{ for (const auto &q : req.epgQueries) if (!q.hasEventId) return true; return false; }())
-                GetSystemTimeAsFileTime(&ft);
-
-            const auto &queries = req.epgQueries;
-            if (queries.size() == 1) {
-                // 単体 → JSON オブジェクト
-                const auto &q = queries[0];
-                TVTest::EpgEventQueryInfo qi = {};
-                qi.NetworkID         = q.networkId;
-                qi.TransportStreamID = q.tsId;
-                qi.ServiceID         = q.serviceId;
-                qi.Flags             = 0;
-                if (q.hasEventId) {
-                    qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
-                    qi.EventID = q.eventId;
-                } else {
-                    qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
-                    qi.Time  = ft;
-                }
-                TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
-                req.epgResultJson = BuildEpgSingleJson(q, pEvent);
-                if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
-            } else {
-                // 複数 → JSON 配列
-                std::ostringstream j;
-                j << "[";
-                bool first = true;
-                for (const auto &q : queries) {
-                    if (!first) j << ",";
-                    first = false;
-                    TVTest::EpgEventQueryInfo qi = {};
-                    qi.NetworkID         = q.networkId;
-                    qi.TransportStreamID = q.tsId;
-                    qi.ServiceID         = q.serviceId;
-                    qi.Flags             = 0;
-                    if (q.hasEventId) {
-                        qi.Type    = TVTest::EPG_EVENT_QUERY_EVENTID;
-                        qi.EventID = q.eventId;
-                    } else {
-                        qi.Type  = TVTest::EPG_EVENT_QUERY_TIME;
-                        qi.Time  = ft;
-                    }
-                    TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
-                    j << BuildEpgSingleJson(q, pEvent);
-                    if (pEvent) m_pApp->FreeEpgEventInfo(pEvent);
-                }
-                j << "]";
-                req.epgResultJson = j.str();
-            }
-            req.success = true;
-            break;
-        }
-
-        case WriteRequest::Type::TTREC_RESERVE_DEFAULT: {
-            static const UINT WM_TTREC_GET_MSGVER = WM_APP + 50;
-            static const UINT WM_TTREC_EVENT_PROGRAMGUIDE_COMMAND = WM_APP + 53;
-            static const UINT TTREC_CURRENT_MSGVER = 1;
-            static const UINT COMMAND_RESERVE_DEFAULT = 2;
-
-            // TVTest の EPG に対象イベントが存在するか確認する
-            {
-                TVTest::EpgEventQueryInfo qi = {};
-                qi.NetworkID         = req.epgQuery.networkId;
-                qi.TransportStreamID = req.epgQuery.tsId;
-                qi.ServiceID         = req.epgQuery.serviceId;
-                qi.Type              = TVTest::EPG_EVENT_QUERY_EVENTID;
-                qi.EventID           = req.eventId;
-                qi.Flags             = 0;
-                TVTest::EpgEventInfo *pEvent = m_pApp->GetEpgEventInfo(&qi);
-                if (!pEvent) {
-                    req.responseJson =
-                        R"({"error":"指定された番組の EPG 情報が見つかりません。TVTest の番組表が取得されているか確認してください"})";
-                    break;
-                }
-                m_pApp->FreeEpgEventInfo(pEvent);
-            }
-
-            HWND hwndTTRec = FindTTRecWindowInCurrentProcess();
-            if (!hwndTTRec) {
-                req.responseJson =
-                    R"({"error":"TTRec が見つかりません。TVTest に TTRec プラグインを導入して有効化してください"})";
-                break;
-            }
-
-            LRESULT msgVer = ::SendMessage(hwndTTRec, WM_TTREC_GET_MSGVER, 0, 0);
-            if (msgVer != TTREC_CURRENT_MSGVER) {
-                req.responseJson =
-                    R"({"error":"TTRec のメッセージ互換バージョンが一致しません"})";
-                break;
-            }
-
-            TVTest::ProgramGuideCommandParam param = {};
-            param.ID = COMMAND_RESERVE_DEFAULT;
-            param.Action = TVTest::PROGRAMGUIDE_COMMAND_ACTION_MOUSE;
-            param.Program.NetworkID = req.epgQuery.networkId;
-            param.Program.TransportStreamID = req.epgQuery.tsId;
-            param.Program.ServiceID = req.epgQuery.serviceId;
-            param.Program.EventID = req.eventId;
-            param.Program.StartTime = req.startTime;
-            param.Program.Duration = req.duration;
-
-            LRESULT rv = ::SendMessage(
-                hwndTTRec,
-                WM_TTREC_EVENT_PROGRAMGUIDE_COMMAND,
-                COMMAND_RESERVE_DEFAULT,
-                reinterpret_cast<LPARAM>(&param));
-
-            req.success = rv != FALSE;
-            req.responseJson = req.success
-                ? R"({"success":true,"mode":"default","note":"TTRec のデフォルト予約設定に従って追加しました。TTRec 側のデフォルトが「見るだけ」の場合は見るだけ予約になります"})"
-                : R"({"error":"TTRec への予約追加に失敗しました。TTRec が有効で、対象番組の EPG 情報が利用可能か確認してください"})";
-            break;
-        }
-        }
-
-        SetEvent(req.hDone);
+        RequestProcessContext ctx;
+        ctx.app                = m_pApp;
+        ctx.stateMutex         = &m_stateMutex;
+        ctx.state              = &m_state;
+        ctx.refreshChannel     = [this] { RefreshChannel(); };
+        ctx.refreshChannelList = [this] { RefreshChannelList(); };
+        ProcessWriteRequest(req, ctx);
     }
 
     // HTTP スレッドからリクエストを投げてメインスレッドの処理を待つ
@@ -1038,8 +229,7 @@ private:
             std::lock_guard<std::mutex> lk(m_queueMutex);
             m_requestQueue.push(req);
         }
-        // 最大 3 秒待機 (タイマー 50ms なので通常は即座)
-        if (WaitForSingleObject(req->hDone, 3000) != WAIT_OBJECT_0) {
+        if (WaitForSingleObject(req->hDone, DISPATCH_TIMEOUT_MS) != WAIT_OBJECT_0) {
             req->success      = false;
             req->responseJson = R"({"error":"タイムアウト"})";
         }
@@ -1160,11 +350,20 @@ private:
     void StartServer()
     {
         if (m_serverStarted) return;
-        SetupRoutes();
+        if (!m_routesConfigured) {
+            SetupRoutes();
+            m_routesConfigured = true;
+        }
+        int port = m_settings.port;
+
+        if (!m_httpServer.bind_to_port("0.0.0.0", port)) {
+            m_httpServer.stop();
+            return;
+        }
+
         m_serverStarted = true;
-        int port = m_settings.port;  // ← 設定されたポートを使用
-        m_httpThread = std::thread([this, port] {
-            m_httpServer.listen("0.0.0.0", port);
+        m_httpThread = std::thread([this] {
+            m_httpServer.listen_after_bind();
         });
     }
 
@@ -1176,611 +375,42 @@ private:
         m_serverStarted = false;
     }
 
-    static void Cors(httplib::Response &res)
-    {
-        res.set_header("Access-Control-Allow-Origin",  "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Content-Type");
-    }
-
-    static void Json(httplib::Response &res, const std::string &body, int status = 200)
-    {
-        Cors(res);
-        res.status = status;
-        res.set_content(body, "application/json; charset=utf-8");
-    }
-
     void SetupRoutes()
     {
-        // IP フィルター: 全リクエストに先立って許可/拒否を確認
         m_httpServer.set_pre_routing_handler(
             [this](const httplib::Request &req, httplib::Response &res)
                 -> httplib::Server::HandlerResponse
             {
                 if (!IsIpAllowed(req.remote_addr)) {
-                    Json(res, R"({"error":"Forbidden"})", 403);
+                    TVTestHTTP::SendJson(res, R"({"error":"Forbidden"})", 403);
                     return httplib::Server::HandlerResponse::Handled;
                 }
                 return httplib::Server::HandlerResponse::Unhandled;
             });
 
-        // CORS プリフライト
         m_httpServer.Options(".*", [](const httplib::Request &, httplib::Response &res) {
-            Cors(res);
+            TVTestHTTP::SetCorsHeaders(res);
         });
 
-        // ------------------------------------------------------------------
-        // POST /api/ttrec/reserve/default
-        // Body:
-        // {
-        //   "onid":32736,
-        //   "tsid":32736,
-        //   "sid":1024,
-        //   "eid":12345,
-        //   "startTime":"2026-03-26T02:00:00",
-        //   "duration":1800
-        // }
-        // EDCB と共通の onid/tsid/sid/eid 形式を優先して受け付ける。
-        // networkId/serviceId/transportStreamId/eventId も後方互換で受け付ける。
-        // TTRec のデフォルト予約設定に従って追加する。
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/ttrec/reserve/default", [this](const httplib::Request &req, httplib::Response &res) {
-            auto state = SnapState();
-            EpgQuery q = {};
-            if (!ResolveEpgQuery(req.body, state.channelList, q)) {
-                Json(res, R"({"error":"onid+sid(+tsid) または networkId+serviceId(+transportStreamId) または space+channel が必要です"})", 400);
-                return;
-            }
+        TVTestHTTP::RegisterStateRoutes(
+            m_httpServer,
+            [this] { return SnapState(); },
+            TVTest::RECORD_STATUS_RECORDING);
 
-            int eventId = ParseIntField(req.body, "eid");
-            if (eventId == INT_MIN) eventId = ParseIntField(req.body, "eventId");
-            int duration = ParseIntField(req.body, "duration");
-            std::string startTimeText = ParseStrField(req.body, "startTime");
-            if (eventId == INT_MIN || duration == INT_MIN || startTimeText.empty()) {
-                Json(res, R"({"error":"eid(eventId)・startTime・duration が必要です"})", 400);
-                return;
-            }
-            if (eventId < 0 || eventId > 0xFFFF || duration < 0) {
-                Json(res, R"({"error":"eventId または duration の値が不正です"})", 400);
-                return;
-            }
-
-            SYSTEMTIME startTime = {};
-            if (!ParseIso8601Local(startTimeText, startTime)) {
-                Json(res, R"({"error":"startTime は YYYY-MM-DDTHH:MM:SS 形式で指定してください"})", 400);
-                return;
-            }
-
-            auto wreq = std::make_shared<WriteRequest>();
-            wreq->type = WriteRequest::Type::TTREC_RESERVE_DEFAULT;
-            wreq->epgQuery = q;
-            wreq->eventId = static_cast<WORD>(eventId);
-            wreq->startTime = startTime;
-            wreq->duration = static_cast<DWORD>(duration);
-            Dispatch(wreq);
-            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/ttrec/reserves
-        // TTRec の予約一覧を JSON 配列で返す。
-        // TTRec の HINSTANCE から _Reserves.txt のパスを解決して直接読み込む。
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/ttrec/reserves", [](const httplib::Request &, httplib::Response &res) {
-            static constexpr LPCTSTR TTREC_WINDOW_CLASS = TEXT("TVTest TTRec");
-            HWND hwndTTRec = nullptr;
-            while ((hwndTTRec = ::FindWindowEx(nullptr, hwndTTRec, TTREC_WINDOW_CLASS, nullptr)) != nullptr) {
-                DWORD pid = 0;
-                ::GetWindowThreadProcessId(hwndTTRec, &pid);
-                if (pid == ::GetCurrentProcessId()) break;
-                hwndTTRec = nullptr;
-            }
-            if (!hwndTTRec) {
-                Json(res, R"({"error":"TTRec が見つかりません。TVTest に TTRec プラグインを導入して有効化してください"})", 500);
-                return;
-            }
-
-            // TTRec の HINSTANCE から DLL パスを取得し _Reserves.txt のパスを構築
-            HINSTANCE hinstTTRec = reinterpret_cast<HINSTANCE>(
-                ::GetWindowLongPtr(hwndTTRec, GWLP_HINSTANCE));
-            wchar_t dllPath[MAX_PATH] = {};
-            if (!::GetModuleFileNameW(hinstTTRec, dllPath, MAX_PATH)) {
-                Json(res, R"({"error":"TTRec のパスを取得できません"})", 500);
-                return;
-            }
-            wchar_t reservePath[MAX_PATH + 16] = {};
-            ::wcscpy_s(reservePath, dllPath);
-            wchar_t *dot = ::wcsrchr(reservePath, L'.');
-            if (dot) *dot = L'\0';
-            ::wcscat_s(reservePath, L"_Reserves.txt");
-
-            // BOM 付き UTF-16 LE ファイルを読み込む
-            HANDLE hFile = ::CreateFileW(reservePath, GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile == INVALID_HANDLE_VALUE) {
-                Json(res, R"([])", 200);  // 予約ファイルなし = 予約なし
-                return;
-            }
-            DWORD fileBytes = ::GetFileSize(hFile, nullptr);
-            std::wstring content;
-            if (fileBytes >= sizeof(wchar_t) * 2) {
-                wchar_t bom = 0;
-                DWORD rd = 0;
-                if (::ReadFile(hFile, &bom, sizeof(wchar_t), &rd, nullptr) && bom == L'\xFEFF') {
-                    DWORD wchars = (fileBytes / sizeof(wchar_t)) - 1;
-                    content.resize(wchars);
-                    ::ReadFile(hFile, &content[0], wchars * sizeof(wchar_t), &rd, nullptr);
-                    content.resize(rd / sizeof(wchar_t));
-                }
-            }
-            ::CloseHandle(hFile);
-
-            // タブ区切りフィールドを先頭から取り出すラムダ
-            auto popField = [](std::wstring &s) -> std::wstring {
-                size_t tab = s.find(L'\t');
-                if (tab == std::wstring::npos) {
-                    std::wstring r;
-                    std::swap(r, s);
-                    return r;
-                }
-                std::wstring r = s.substr(0, tab);
-                s.erase(0, tab + 1);
-                return r;
-            };
-
-            std::ostringstream j;
-            j << "[";
-            bool first = true;
-            size_t pos = 0;
-
-            for (;;) {
-                size_t nl = content.find(L'\n', pos);
-                std::wstring line = (nl == std::wstring::npos)
-                    ? content.substr(pos)
-                    : content.substr(pos, nl - pos);
-                if (nl == std::wstring::npos) {
-                    // 最終行
-                    if (!line.empty() && line.back() == L'\r') line.pop_back();
-                    pos = content.size() + 1;
-                } else {
-                    if (!line.empty() && line.back() == L'\r') line.pop_back();
-                    pos = nl + 1;
-                }
-                if (line.empty()) {
-                    if (pos > content.size()) break;
-                    continue;
-                }
-
-                std::wstring rest = line;
-                int networkID  = (int)wcstol(popField(rest).c_str(), nullptr, 16);
-                int tsID       = (int)wcstol(popField(rest).c_str(), nullptr, 16);
-                int serviceID  = (int)wcstol(popField(rest).c_str(), nullptr, 16);
-                int eventID    = (int)wcstol(popField(rest).c_str(), nullptr, 16);
-                std::string startTime = WStrToUtf8(popField(rest));
-
-                // "hh:mm:ss[!][#][$]"
-                std::wstring durField = popField(rest);
-                int durSec = 0;
-                bool followPF = false, isEnabled = true, followFixed = false;
-                if (durField.size() >= 8) {
-                    durSec = (int)wcstol(durField.substr(0, 2).c_str(), nullptr, 10) * 3600
-                           + (int)wcstol(durField.substr(3, 2).c_str(), nullptr, 10) * 60
-                           + (int)wcstol(durField.substr(6, 2).c_str(), nullptr, 10);
-                    for (size_t k = 8; k < durField.size(); ++k) {
-                        if      (durField[k] == L'!') followPF    = true;
-                        else if (durField[k] == L'#') isEnabled   = false;
-                        else if (durField[k] == L'$') followFixed = true;
-                    }
-                }
-
-                // 番組名 (先頭が PREFIX_EPGORIGIN=0x11 なら除去)
-                std::wstring nameW = popField(rest);
-                if (!nameW.empty() && nameW[0] == L'\x11') nameW = nameW.substr(1);
-                std::string eventName = JsonStr(nameW);
-
-                int startMargin = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-                int endMargin   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-                // priority は (PRIORITY - PRIORITY_MOD) で保存。負値 = 見るだけ
-                int priorityRel = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-                int onStopped   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-                std::wstring saveDirW  = popField(rest);
-                std::wstring saveNameW = popField(rest);
-                int startTrim = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-                int endTrim   = (int)wcstol(popField(rest).c_str(), nullptr, 10);
-
-                bool isViewOnly = (priorityRel < 0);
-                const char *followMode = followFixed ? "fixed" : (followPF ? "following" : "default");
-
-                if (!first) j << ",";
-                first = false;
-                j << "{"
-                  << "\"networkId\":"         << networkID  << ","
-                  << "\"transportStreamId\":" << tsID       << ","
-                  << "\"serviceId\":"         << serviceID  << ","
-                  << "\"eventId\":"           << eventID    << ","
-                  << "\"startTime\":\""       << startTime  << "\","
-                  << "\"duration\":"          << durSec     << ","
-                  << "\"eventName\":\""       << eventName  << "\","
-                  << "\"isEnabled\":"         << (isEnabled  ? "true" : "false") << ","
-                  << "\"isViewOnly\":"        << (isViewOnly ? "true" : "false") << ","
-                  << "\"followMode\":\""      << followMode << "\","
-                  << "\"recOption\":{"
-                  << "\"startMargin\":"  << startMargin << ","
-                  << "\"endMargin\":"    << endMargin   << ","
-                  << "\"priority\":"     << priorityRel << ","
-                  << "\"onStopped\":"    << onStopped   << ","
-                  << "\"saveDir\":\""    << JsonStr(saveDirW  == L"*" ? L"" : saveDirW)  << "\","
-                  << "\"saveName\":\""   << JsonStr(saveNameW == L"*" ? L"" : saveNameW) << "\","
-                  << "\"startTrim\":"    << startTrim   << ","
-                  << "\"endTrim\":"      << endTrim
-                  << "}"
-                  << "}";
-
-                if (pos > content.size()) break;
-            }
-            j << "]";
-            Json(res, j.str(), 200);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/status
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/status", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            std::ostringstream j;
-            j << "{";
-
-            // channel
-            if (s.hasChannel) {
-                j << "\"channel\":{"
-                  << "\"space\":"            << s.space            << ","
-                  << "\"channel\":"          << s.channel          << ","
-                  << "\"remoteControlKey\":" << s.remoteControlKey << ","
-                  << "\"serviceId\":"        << s.serviceID        << ","
-                  << "\"networkId\":"        << s.networkID        << ","
-                  << "\"transportStreamId\":" << s.tsID            << ","
-                  << "\"name\":\""           << JsonStr(s.channelName)  << "\","
-                  << "\"networkName\":\""    << JsonStr(s.networkName)  << "\""
-                  << "},";
-            } else {
-                j << "\"channel\":null,";
-            }
-
-            j << "\"volume\":"       << s.volume                              << ","
-              << "\"mute\":"         << (s.mute ? "true" : "false")           << ","
-              << "\"recordStatus\":" << s.recordStatus                        << ","
-              << "\"recording\":"    << (s.recordStatus == TVTest::RECORD_STATUS_RECORDING ? "true" : "false");
-
-            if (s.hasProgramInfo) {
-                j << ",\"program\":{"
-                  << "\"name\":\""  << JsonStr(s.programName) << "\","
-                  << "\"text\":\""  << JsonStr(s.programText) << "\""
-                  << "}";
-            } else {
-                j << ",\"program\":null";
-            }
-            j << "}";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/channels
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/channels", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            std::ostringstream j;
-            j << "[";
-            bool first = true;
-            for (const auto &e : s.channelList) {
-                if (!first) j << ",";
-                first = false;
-                j << "{"
-                  << "\"space\":"            << e.space            << ","
-                  << "\"channel\":"          << e.channel          << ","
-                  << "\"remoteControlKey\":" << e.remoteControlKey << ","
-                  << "\"serviceId\":"        << e.serviceID        << ","
-                  << "\"networkId\":"        << e.networkID        << ","
-                  << "\"name\":\""           << JsonStr(e.name)        << "\","
-                  << "\"networkName\":\""    << JsonStr(e.networkName) << "\""
-                  << "}";
-            }
-            j << "]";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/channel
-        // Body: {"remoteControlKey":3}
-        //    or {"space":0,"channel":5}
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/channel", [this](const httplib::Request &req, httplib::Response &res) {
-            const auto &body = req.body;
-            auto wreq = std::make_shared<WriteRequest>();
-
-            int rck = ParseIntField(body, "remoteControlKey");
-            if (rck != INT_MIN) {
-                wreq->type            = WriteRequest::Type::SET_CHANNEL_RCK;
-                wreq->remoteControlKey = rck;
-            } else {
-                int sp = ParseIntField(body, "space");
-                int ch = ParseIntField(body, "channel");
-                if (sp == INT_MIN || ch == INT_MIN) {
-                    Json(res, R"({"error":"remoteControlKey または space+channel が必要です"})", 400);
-                    return;
-                }
-                wreq->type    = WriteRequest::Type::SET_CHANNEL_SPACE;
-                wreq->space   = sp;
-                wreq->channel = ch;
-            }
-            Dispatch(wreq);
-            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/volume
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/volume", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            std::ostringstream j;
-            j << "{\"volume\":" << s.volume
-              << ",\"mute\":"   << (s.mute ? "true" : "false") << "}";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/volume
-        // Body: {"volume":50} or {"mute":true} or both
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/volume", [this](const httplib::Request &req, httplib::Response &res) {
-            const auto &body = req.body;
-
-            int vol = ParseIntField(body, "volume");
-            if (vol != INT_MIN) {
-                if (vol < 0 || vol > 100) {
-                    Json(res, R"({"error":"volume は 0〜100 の範囲です"})", 400);
-                    return;
-                }
-                auto wreq   = std::make_shared<WriteRequest>();
-                wreq->type  = WriteRequest::Type::SET_VOLUME;
-                wreq->volume = vol;
-                Dispatch(wreq);
-                if (!wreq->success) { Json(res, wreq->responseJson, 500); return; }
-            }
-
-            bool muteVal = false;
-            if (ParseBoolField(body, "mute", muteVal)) {
-                auto wreq  = std::make_shared<WriteRequest>();
-                wreq->type = WriteRequest::Type::SET_MUTE;
-                wreq->mute = muteVal;
-                Dispatch(wreq);
-                if (!wreq->success) { Json(res, wreq->responseJson, 500); return; }
-            }
-
-            Json(res, R"({"success":true})");
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/program
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/program", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            if (!s.hasProgramInfo) { Json(res, R"({"program":null})"); return; }
-            std::ostringstream j;
-            j << "{\"program\":{"
-              << "\"name\":\""  << JsonStr(s.programName) << "\","
-              << "\"text\":\""  << JsonStr(s.programText) << "\""
-              << "}}";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/program/channel
-        // クエリパラメータ (いずれか):
-        //   ?space=0&channel=5
-        //   ?networkId=32736&serviceId=1024
-        //   ?networkId=32736&serviceId=1024&transportStreamId=32736
-        // オプション:
-        //   &eventId=12345  指定すると EPG_EVENT_QUERY_EVENTID で当該イベントを取得
-        //                   省略時は現在放送中の番組を取得 (EPG_EVENT_QUERY_TIME)
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/program/channel", [this](const httplib::Request &req, httplib::Response &res) {
-            EpgQuery q = {};
-            auto s = SnapState();
-
-            if (req.has_param("space") && req.has_param("channel")) {
-                // space + channel → channelList から ID を補完
-                int sp = std::stoi(req.get_param_value("space"));
-                int ch = std::stoi(req.get_param_value("channel"));
-                bool found = false;
-                for (const auto &e : s.channelList) {
-                    if (e.space == sp && e.channel == ch) {
-                        q.networkId = static_cast<WORD>(e.networkID);
-                        q.tsId      = static_cast<WORD>(e.tsID);
-                        q.serviceId = static_cast<WORD>(e.serviceID);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    Json(res, R"({"error":"指定された space+channel が見つかりません"})", 404);
-                    return;
-                }
-            } else if (req.has_param("networkId") && req.has_param("serviceId")) {
-                q.networkId = static_cast<WORD>(std::stoi(req.get_param_value("networkId")));
-                q.serviceId = static_cast<WORD>(std::stoi(req.get_param_value("serviceId")));
-                if (req.has_param("transportStreamId")) {
-                    q.tsId = static_cast<WORD>(std::stoi(req.get_param_value("transportStreamId")));
-                } else {
-                    // channelList から tsId を補完
-                    for (const auto &e : s.channelList) {
-                        if (e.networkID == q.networkId && e.serviceID == q.serviceId) {
-                            q.tsId = static_cast<WORD>(e.tsID);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                Json(res, R"({"error":"space+channel または networkId+serviceId が必要です"})", 400);
-                return;
-            }
-
-            // eventId が指定されていれば EPG_EVENT_QUERY_EVENTID を使う
-            if (req.has_param("eventId")) {
-                q.eventId    = static_cast<WORD>(std::stoi(req.get_param_value("eventId")));
-                q.hasEventId = true;
-            }
-
-            auto wreq = std::make_shared<WriteRequest>();
-            wreq->type       = WriteRequest::Type::GET_EPG_EVENT;
-            wreq->epgQueries = {q};
-            Dispatch(wreq);
-            Json(res, wreq->epgResultJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/program/channels
-        // Body: JSON 配列
-        //   [{"space":0,"channel":5}, {"networkId":32736,"serviceId":1024}, ...]
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/program/channels", [this](const httplib::Request &req, httplib::Response &res) {
-            auto s       = SnapState();
-            auto queries = ParseEpgQueryArray(req.body, s.channelList);
-            if (queries.empty()) {
-                Json(res, R"({"error":"有効なチャンネル指定が1件もありません"})", 400);
-                return;
-            }
-            auto wreq        = std::make_shared<WriteRequest>();
-            wreq->type       = WriteRequest::Type::GET_EPG_EVENT;
-            wreq->epgQueries = std::move(queries);
-            Dispatch(wreq);
-            Json(res, wreq->epgResultJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/record/status
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/record/status", [this](const httplib::Request &, httplib::Response &res) {
-            auto s = SnapState();
-            std::ostringstream j;
-            j << "{\"status\":"    << s.recordStatus
-              << ",\"recording\":" << (s.recordStatus == TVTest::RECORD_STATUS_RECORDING ? "true" : "false")
-              << "}";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/record/start
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/record/start", [this](const httplib::Request &, httplib::Response &res) {
-            auto wreq  = std::make_shared<WriteRequest>();
-            wreq->type = WriteRequest::Type::START_RECORD;
-            Dispatch(wreq);
-            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // GET /api/driver
-        // 現在の BonDriver ファイル名と利用可能なドライバ一覧を返す
-        // ------------------------------------------------------------------
-        m_httpServer.Get("/api/driver", [this](const httplib::Request &, httplib::Response &res) {
-            // 現在のドライバ名
-            wchar_t cur[MAX_PATH] = {};
-            m_pApp->GetDriverName(cur, MAX_PATH);
-
-            // 利用可能なドライバを列挙
-            std::ostringstream j;
-            j << "{\"current\":\"" << JsonStr(std::wstring(cur)) << "\",\"drivers\":[";
-            bool first = true;
-            for (int i = 0; ; ++i) {
-                wchar_t name[MAX_PATH] = {};
-                if (m_pApp->EnumDriver(i, name, MAX_PATH) <= 0) break;
-                if (!first) j << ",";
-                first = false;
-                j << "\"" << JsonStr(std::wstring(name)) << "\"";
-            }
-            j << "]}";
-            Json(res, j.str());
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/driver
-        // Body: {"driver":"BonDriver_Proxy_S.dll"}
-        //    or {"driver":"BonDriver_Proxy_S.dll","remoteControlKey":4}
-        //    or {"driver":"BonDriver_Proxy_S.dll","space":0,"channel":0}
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/driver", [this](const httplib::Request &req, httplib::Response &res) {
-            std::string name = ParseStrField(req.body, "driver");
-            if (name.empty()) {
-                Json(res, R"({"error":"driver フィールドが必要です"})", 400);
-                return;
-            }
-            auto wreq        = std::make_shared<WriteRequest>();
-            wreq->type       = WriteRequest::Type::SET_DRIVER;
-            wreq->driverName = StrToWStr(name);
-
-            int rck = ParseIntField(req.body, "remoteControlKey");
-            int sp  = ParseIntField(req.body, "space");
-            int ch  = ParseIntField(req.body, "channel");
-            if (rck != INT_MIN) {
-                wreq->hasChannel       = true;
-                wreq->remoteControlKey = rck;
-            } else if (sp != INT_MIN && ch != INT_MIN) {
-                wreq->hasChannel = true;
-                wreq->space      = sp;
-                wreq->channel    = ch;
-            }
-
-            Dispatch(wreq);
-            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
-
-        // ------------------------------------------------------------------
-        // POST /api/record/stop
-        // ------------------------------------------------------------------
-        m_httpServer.Post("/api/record/stop", [this](const httplib::Request &, httplib::Response &res) {
-            auto wreq  = std::make_shared<WriteRequest>();
-            wreq->type = WriteRequest::Type::STOP_RECORD;
-            Dispatch(wreq);
-            Json(res, wreq->responseJson, wreq->success ? 200 : 500);
-        });
+        TVTestHTTP::DynamicRouteContext dynCtx;
+        dynCtx.app       = m_pApp;
+        dynCtx.snapState = [this] { return SnapState(); };
+        dynCtx.dispatch  = [this](std::shared_ptr<WriteRequest> req) { Dispatch(req); };
+        TVTestHTTP::RegisterDynamicRoutes(m_httpServer, dynCtx);
     }
 
     // -------------------------------------------------------------------------
     // 設定の読み書き (メインスレッドから呼ぶこと)
     // -------------------------------------------------------------------------
 
-    void LoadSettings()
-    {
-        std::wstring ini = GetIniFilePath();
-        const wchar_t *sec = L"Settings";
+    void LoadSettings()  { m_settings = TVTestHTTP::LoadPluginSettings(); }
+    void SaveSettings() const { TVTestHTTP::SavePluginSettings(m_settings); }
 
-        int port = static_cast<int>(
-            GetPrivateProfileIntW(sec, L"Port", HTTP_PORT_DEFAULT, ini.c_str()));
-        if (port < 1024 || port > 65535) port = HTTP_PORT_DEFAULT;
-        m_settings.port = port;
-
-        wchar_t buf[4096] = {};
-        GetPrivateProfileStringW(sec, L"AllowList", L"", buf, _countof(buf), ini.c_str());
-        m_settings.allowList = buf;
-
-        GetPrivateProfileStringW(sec, L"DenyList", L"", buf, _countof(buf), ini.c_str());
-        m_settings.denyList = buf;
-    }
-
-    void SaveSettings() const
-    {
-        std::wstring ini = GetIniFilePath();
-        const wchar_t *sec = L"Settings";
-
-        wchar_t portStr[16] = {};
-        _itow_s(m_settings.port, portStr, 10);
-        WritePrivateProfileStringW(sec, L"Port",      portStr,                  ini.c_str());
-        WritePrivateProfileStringW(sec, L"AllowList", m_settings.allowList.c_str(), ini.c_str());
-        WritePrivateProfileStringW(sec, L"DenyList",  m_settings.denyList.c_str(),  ini.c_str());
-    }
-
-    // CIDR ブロックリストを設定から再構築 (メインスレッドから呼ぶこと)
     void UpdateCidrBlocks()
     {
         auto newAllow = ParseCidrList(m_settings.allowList);
@@ -1790,7 +420,6 @@ private:
         m_denyBlocks  = std::move(newDeny);
     }
 
-    // 接続元 IP が許可されているか (HTTP スレッドから呼んでよい)
     bool IsIpAllowed(const std::string &ip) const
     {
         std::vector<CidrBlock> allows, denies;
@@ -1799,9 +428,7 @@ private:
             allows = m_allowBlocks;
             denies = m_denyBlocks;
         }
-        // 拒否リストに含まれていれば拒否
         if (!denies.empty() && IpMatchesList(ip, denies)) return false;
-        // 許可リストが空でなければリストに含まれる場合のみ許可
         if (!allows.empty() && !IpMatchesList(ip, allows)) return false;
         return true;
     }
@@ -1830,7 +457,6 @@ private:
         UpdateCidrBlocks();
 
         if (portChanged && m_serverStarted) {
-            // ポート変更: サーバーを再起動
             StopServer();
             StartServer();
         }
@@ -1839,6 +465,6 @@ private:
 };
 
 // =============================================================================
-// プラグインクラスファクトリ (SDK マクロが呼び出す)
+// プラグインクラスファクトリ
 // =============================================================================
 TVTest::CTVTestPlugin *CreatePluginClass() { return new CTVTestHTTPPlugin; }

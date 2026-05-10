@@ -51,6 +51,23 @@ if(NOT EXISTS "${HTTPLIB_H}")
     endif()
 endif()
 
+# nlohmann/json (ヘッダーオンリー JSON ライブラリ)
+set(JSON_H "${SDK_DIR}/nlohmann/json.hpp")
+if(NOT EXISTS "${JSON_H}")
+    message(STATUS "Downloading nlohmann/json.hpp ...")
+    file(MAKE_DIRECTORY "${SDK_DIR}/nlohmann")
+    file(DOWNLOAD
+        "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
+        "${JSON_H}"
+        SHOW_PROGRESS
+        STATUS DL_STATUS
+    )
+    list(GET DL_STATUS 0 DL_CODE)
+    if(NOT DL_CODE EQUAL 0)
+        message(FATAL_ERROR "nlohmann/json.hpp のダウンロードに失敗しました (${DL_STATUS})")
+    endif()
+endif()
+
 # =============================================================================
 # ターゲット
 # =============================================================================
