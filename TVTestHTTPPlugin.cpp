@@ -225,6 +225,11 @@ private:
     // HTTP スレッドからリクエストを投げてメインスレッドの処理を待つ
     void Dispatch(std::shared_ptr<WriteRequest> req)
     {
+        if (!req->hDone.valid()) {
+            req->success      = false;
+            req->responseJson = R"({"error":"内部エラー: イベントハンドルの作成に失敗しました"})";
+            return;
+        }
         {
             std::lock_guard<std::mutex> lk(m_queueMutex);
             m_requestQueue.push(req);
