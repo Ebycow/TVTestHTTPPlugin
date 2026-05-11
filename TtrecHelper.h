@@ -137,7 +137,7 @@ static bool LoadTtrecReservesJson(HWND hwndTTRec, std::string &json)
 
     DWORD fileBytes = ::GetFileSize(hFile, nullptr);
     std::wstring content;
-    if (fileBytes >= sizeof(wchar_t) * 2) {
+    if (fileBytes != INVALID_FILE_SIZE && fileBytes >= sizeof(wchar_t) * 2) {
         wchar_t bom = 0;
         DWORD rd = 0;
         if (::ReadFile(hFile, &bom, sizeof(wchar_t), &rd, nullptr) && bom == L'\xFEFF') {
