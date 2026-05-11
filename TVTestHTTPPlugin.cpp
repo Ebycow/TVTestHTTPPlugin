@@ -363,6 +363,9 @@ private:
 
         if (!m_httpServer.bind_to_port("0.0.0.0", port)) {
             m_httpServer.stop();
+            wchar_t msg[128];
+            ::swprintf_s(msg, L"TVTestHTTPPlugin: ポート %d へのバインドに失敗しました。他のプロセスが使用中の可能性があります。", port);
+            m_pApp->AddLog(msg, TVTest::LOG_TYPE_ERROR);
             return;
         }
 
