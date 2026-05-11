@@ -313,7 +313,8 @@ static void RegisterDynamicRoutes(httplib::Server &server, DynamicRouteContext c
             SendJson(res, R"({"error":"eid(eventId)・startTime・duration が必要です"})", 400);
             return;
         }
-        if (eventId > 0xFFFF) {
+        constexpr int kMaxDurationSec = 24 * 60 * 60; // 24 時間
+        if (eventId > 0xFFFF || duration > kMaxDurationSec) {
             SendJson(res, R"({"error":"eventId または duration の値が不正です"})", 400);
             return;
         }
